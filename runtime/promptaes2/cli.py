@@ -64,6 +64,8 @@ def _add_holistic_parser(subparsers):
     parser.add_argument("--scheduler_t0", type=int, default=10)
     parser.add_argument("--scheduler_tmult", type=int, default=2)
     parser.add_argument("--scheduler_eta_min", type=float, default=1e-6)
+    parser.add_argument("--imbalance_mitigation", action="store_true", default=False)
+    parser.add_argument("--imbalance_max_weight", type=float, default=5.0)
 
     parser.add_argument("--evolution_stage", type=str, choices=["baseline", "cross_attention", "full"], default="full")
     parser.add_argument("--warmup_epochs", type=int, default=20)
@@ -143,6 +145,8 @@ def _add_trait_score_parser(subparsers):
     parser.add_argument("--scheduler_t0", type=int, default=10)
     parser.add_argument("--scheduler_tmult", type=int, default=2)
     parser.add_argument("--scheduler_eta_min", type=float, default=1e-6)
+    parser.add_argument("--imbalance_mitigation", action="store_true", default=False)
+    parser.add_argument("--imbalance_max_weight", type=float, default=5.0)
 
     parser.add_argument("--evolution_stage", type=str, choices=["baseline", "cross_attention", "full"], default="full")
     parser.add_argument("--warmup_epochs", type=int, default=20)
@@ -277,6 +281,8 @@ def _validate_parsed_args(args, parser):
             parser.error("--classifier_num_experts must be >= 1")
         if args.router_top_k < 1:
             parser.error("--router_top_k must be >= 1")
+        if args.imbalance_max_weight <= 0:
+            parser.error("--imbalance_max_weight must be > 0")
         if args.command == "train-holistic":
             if args.backbone_lr <= 0:
                 parser.error("--backbone_lr must be > 0")

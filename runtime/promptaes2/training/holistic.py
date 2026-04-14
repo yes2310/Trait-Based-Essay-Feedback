@@ -9,7 +9,7 @@ import torch
 import torch.nn as nn
 from sklearn.model_selection import train_test_split
 from torch.optim.lr_scheduler import CosineAnnealingWarmRestarts
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import DataLoader, Dataset, WeightedRandomSampler
 from tqdm.auto import tqdm
 
 from promptaes2.config import ConfigError, get_dataset_preset, validate_required_columns
@@ -18,6 +18,11 @@ from promptaes2.data.datasets import MultiEmbeddingDataset
 from promptaes2.losses.combined import CombinedLoss
 from promptaes2.models.factory import build_scoring_model
 from promptaes2.utils.checkpoint import EarlyStopping, build_checkpoint_name
+from promptaes2.utils.imbalance import (
+    build_class_weight_tensor,
+    build_weighted_sampler,
+    format_class_weight_summary,
+)
 from promptaes2.utils.metrics import calculate_accuracy_qwk
 
 
@@ -420,6 +425,8 @@ def _maybe_init_wandb(args, run_name_override: str | None = None):
             "val_ratio": args.val_ratio,
             "test_ratio": args.test_ratio,
             "predefined_split_column": getattr(args, "predefined_split_column", None),
+            "imbalance_mitigation": bool(getattr(args, "imbalance_mitigation", False)),
+            "imbalance_max_weight": float(getattr(args, "imbalance_max_weight", 5.0)),
             "epochs": args.epochs,
             "moe_aux_weight": moe_aux_weight,
             "model_variant": getattr(args, "model_variant", "legacy"),
@@ -492,6 +499,12 @@ def _print_holistic_startup_info(args) -> None:
         )
     print(
         f"Evolution stage: {args.evolution_stage} (warmup_epochs={args.warmup_epochs})",
+        flush=True,
+    )
+    print(
+        "Imbalance mitigation: "
+        f"{bool(getattr(args, 'imbalance_mitigation', False))} "
+        f"(max_weight={float(getattr(args, 'imbalance_max_weight', 5.0)):.2f})",
         flush=True,
     )
     print(
@@ -695,6 +708,28 @@ def _run_single_holistic_training(
     val_embeddings = {trait: emb[val_idx] for trait, emb in embeddings_dict.items()}
     test_embeddings = {trait: emb[test_idx] for trait, emb in embeddings_dict.items()}
 
+    imbalance_mitigation = bool(getattr(args, "imbalance_mitigation", False))
+    imbalance_max_weight = float(getattr(args, "imbalance_max_weight", 5.0))
+    class_weights: torch.Tensor | None = None
+    train_sampler: WeightedRandomSampler | None = None
+    if imbalance_mitigation:
+        class_weights, counts = build_class_weight_tensor(
+            labels[train_idx],
+            num_classes=unique_labels_count,
+            max_weight=imbalance_max_weight,
+            device=device,
+        )
+        train_sampler, weights_np, counts_np = build_weighted_sampler(
+            labels[train_idx],
+            num_classes=unique_labels_count,
+            max_weight=imbalance_max_weight,
+        )
+        class_names = [str(label) for label in sorted(unique_labels)]
+        print(
+            "Train class weights: "
+            + format_class_weight_summary(counts_np, weights_np, class_labels=class_names)
+        )
+
     train_dataset = MultiEmbeddingDataset(
         train_embeddings,
         labels[train_idx],
@@ -714,7 +749,8 @@ def _run_single_holistic_training(
     train_loader = DataLoader(
         train_dataset,
         batch_size=args.batch_size,
-        shuffle=True,
+        shuffle=train_sampler is None,
+        sampler=train_sampler,
         drop_last=False,
         num_workers=args.cpu_workers,
     )
@@ -784,11 +820,12 @@ def _run_single_holistic_training(
             beta3=args.beta3,
             beta4=args.beta4,
             margin=args.margin,
+            class_weights=class_weights,
         ).to(device)
         if args.loss_type == "combined"
-        else nn.CrossEntropyLoss().to(device)
+        else nn.CrossEntropyLoss(weight=class_weights).to(device)
     )
-    ce_only_criterion = nn.CrossEntropyLoss().to(device)
+    ce_only_criterion = nn.CrossEntropyLoss(weight=class_weights).to(device)
 
     def _unpack_holistic_batch(batch):
         if args.loss_type == "combined":
@@ -1204,6 +1241,28 @@ def _run_single_holistic_training_e2e(
     val_texts = [texts_all[idx] for idx in val_idx]
     test_texts = [texts_all[idx] for idx in test_idx]
 
+    imbalance_mitigation = bool(getattr(args, "imbalance_mitigation", False))
+    imbalance_max_weight = float(getattr(args, "imbalance_max_weight", 5.0))
+    class_weights: torch.Tensor | None = None
+    train_sampler: WeightedRandomSampler | None = None
+    if imbalance_mitigation:
+        class_weights, counts = build_class_weight_tensor(
+            labels[train_idx],
+            num_classes=unique_labels_count,
+            max_weight=imbalance_max_weight,
+            device=device,
+        )
+        train_sampler, weights_np, counts_np = build_weighted_sampler(
+            labels[train_idx],
+            num_classes=unique_labels_count,
+            max_weight=imbalance_max_weight,
+        )
+        class_names = [str(label) for label in sorted(unique_labels)]
+        print(
+            "Train class weights: "
+            + format_class_weight_summary(counts_np, weights_np, class_labels=class_names)
+        )
+
     train_dataset = _HolisticTextDataset(
         train_texts,
         labels[train_idx],
@@ -1223,7 +1282,8 @@ def _run_single_holistic_training_e2e(
     train_loader = DataLoader(
         train_dataset,
         batch_size=args.batch_size,
-        shuffle=True,
+        shuffle=train_sampler is None,
+        sampler=train_sampler,
         drop_last=False,
         num_workers=args.cpu_workers,
     )
@@ -1308,11 +1368,12 @@ def _run_single_holistic_training_e2e(
             beta3=args.beta3,
             beta4=args.beta4,
             margin=args.margin,
+            class_weights=class_weights,
         ).to(device)
         if args.loss_type == "combined"
-        else nn.CrossEntropyLoss().to(device)
+        else nn.CrossEntropyLoss(weight=class_weights).to(device)
     )
-    ce_only_criterion = nn.CrossEntropyLoss().to(device)
+    ce_only_criterion = nn.CrossEntropyLoss(weight=class_weights).to(device)
 
     unfreeze_epoch = int(getattr(args, "unfreeze_epoch", 0))
     backbones_unfrozen = unfreeze_epoch == 0

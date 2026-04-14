@@ -31,6 +31,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--scheduler_t0", type=int, default=10)
     parser.add_argument("--scheduler_tmult", type=int, default=2)
     parser.add_argument("--scheduler_eta_min", type=float, default=1e-6)
+    parser.add_argument("--imbalance_mitigation", action="store_true", default=False)
+    parser.add_argument("--imbalance_max_weight", type=float, default=5.0)
     parser.add_argument("--print_epoch_metrics", action="store_true", default=False)
     parser.add_argument("--use_wandb", action="store_true", default=False)
     parser.add_argument("--wandb_project_name", type=str, default="promptaes2-pretrain")
@@ -70,6 +72,8 @@ def _validate_parsed_args(args, parser: argparse.ArgumentParser) -> None:
         parser.error("--scheduler_t0 must be >= 1")
     if args.scheduler_tmult < 1:
         parser.error("--scheduler_tmult must be >= 1")
+    if args.imbalance_max_weight <= 0:
+        parser.error("--imbalance_max_weight must be > 0")
 
 
 def main(argv: list[str] | None = None):

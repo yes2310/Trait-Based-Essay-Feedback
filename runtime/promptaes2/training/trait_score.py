@@ -8,7 +8,7 @@ import torch
 import torch.nn as nn
 from sklearn.model_selection import train_test_split
 from torch.optim.lr_scheduler import CosineAnnealingWarmRestarts
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, WeightedRandomSampler
 from tqdm.auto import tqdm
 
 from promptaes2.config import ConfigError, validate_required_columns
@@ -17,6 +17,11 @@ from promptaes2.data.datasets import MultiEmbeddingDataset
 from promptaes2.models.factory import build_scoring_model
 from promptaes2.training.holistic import _extract_embeddings_from_trait_checkpoints
 from promptaes2.utils.checkpoint import EarlyStopping, build_checkpoint_name
+from promptaes2.utils.imbalance import (
+    build_class_weight_tensor,
+    build_weighted_sampler,
+    format_class_weight_summary,
+)
 from promptaes2.utils.metrics import calculate_accuracy_qwk
 
 
@@ -158,6 +163,8 @@ def _maybe_init_wandb(args, target_trait: str):
             "val_ratio": args.val_ratio,
             "test_ratio": args.test_ratio,
             "predefined_split_column": getattr(args, "predefined_split_column", None),
+            "imbalance_mitigation": bool(getattr(args, "imbalance_mitigation", False)),
+            "imbalance_max_weight": float(getattr(args, "imbalance_max_weight", 5.0)),
             "moe_aux_weight": args.moe_aux_weight,
             "model_variant": getattr(args, "model_variant", "legacy"),
             "group_num_experts": int(getattr(args, "group_num_experts", 8)),
@@ -187,14 +194,23 @@ def _resolve_embeddings_and_essay(args, required_embedding_traits: list[str], de
     return embeddings_dict, essay
 
 
-def _build_loader(embeddings_dict: dict[str, np.ndarray], labels: np.ndarray, indices: np.ndarray, args, shuffle: bool):
+def _build_loader(
+    embeddings_dict: dict[str, np.ndarray],
+    labels: np.ndarray,
+    indices: np.ndarray,
+    args,
+    *,
+    shuffle: bool,
+    sampler: WeightedRandomSampler | None = None,
+):
     subset_embeddings = {trait: emb[indices] for trait, emb in embeddings_dict.items()}
     subset_labels = labels[indices]
     dataset = MultiEmbeddingDataset(subset_embeddings, subset_labels)
     return DataLoader(
         dataset,
         batch_size=args.batch_size,
-        shuffle=shuffle,
+        shuffle=shuffle if sampler is None else False,
+        sampler=sampler,
         drop_last=False,
         num_workers=args.cpu_workers,
     )
@@ -340,6 +356,8 @@ def run_trait_score_training(args):
     moe_aux_weight = float(getattr(args, "moe_aux_weight", 0.01))
     save_checkpoints = bool(getattr(args, "save_checkpoints", True))
     predefined_split_column = getattr(args, "predefined_split_column", None)
+    imbalance_mitigation = bool(getattr(args, "imbalance_mitigation", False))
+    imbalance_max_weight = float(getattr(args, "imbalance_max_weight", 5.0))
     if predefined_split_column is not None:
         validate_required_columns(essay.columns, [predefined_split_column])
 
@@ -366,6 +384,10 @@ def run_trait_score_training(args):
         f"pre_hetero={bool(getattr(args, 'use_pre_hetero_skip', False))}"
     )
     print(f"Save checkpoints: {save_checkpoints}")
+    print(
+        "Imbalance mitigation: "
+        f"{imbalance_mitigation} (max_weight={imbalance_max_weight:.2f})"
+    )
     if predefined_split_column is None:
         print(
             "Split ratios: "
@@ -435,7 +457,35 @@ def run_trait_score_training(args):
             trait_name: emb[valid_indices]
             for trait_name, emb in embeddings_dict.items()
         }
-        train_loader = _build_loader(trait_embeddings, labels, train_idx, args, shuffle=True)
+        train_sampler: WeightedRandomSampler | None = None
+        criterion = nn.CrossEntropyLoss().to(device)
+        if imbalance_mitigation:
+            class_weights, counts = build_class_weight_tensor(
+                labels[train_idx],
+                num_classes=len(unique_labels),
+                max_weight=imbalance_max_weight,
+                device=device,
+            )
+            criterion = nn.CrossEntropyLoss(weight=class_weights).to(device)
+            train_sampler, weights_np, counts_np = build_weighted_sampler(
+                labels[train_idx],
+                num_classes=len(unique_labels),
+                max_weight=imbalance_max_weight,
+            )
+            class_names = [str(label) for label in sorted(unique_labels)]
+            print(
+                "Train class weights: "
+                + format_class_weight_summary(counts_np, weights_np, class_labels=class_names)
+            )
+
+        train_loader = _build_loader(
+            trait_embeddings,
+            labels,
+            train_idx,
+            args,
+            shuffle=train_sampler is None,
+            sampler=train_sampler,
+        )
         val_loader = _build_loader(trait_embeddings, labels, val_idx, args, shuffle=False)
         test_loader = _build_loader(trait_embeddings, labels, test_idx, args, shuffle=False)
 
@@ -480,8 +530,6 @@ def run_trait_score_training(args):
             if args.scheduler == "cosine"
             else None
         )
-        criterion = nn.CrossEntropyLoss().to(device)
-
         checkpoint_path = output_dir / build_checkpoint_name(args.dataset, "trait_score", target_trait)
         stopper = (
             EarlyStopping(

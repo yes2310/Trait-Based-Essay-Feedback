@@ -19,6 +19,7 @@ class CombinedLoss(nn.Module):
         beta3: float = 1.0,
         beta4: float = 1.0,
         margin: float = 0.0,
+        class_weights: torch.Tensor | None = None,
     ):
         super().__init__()
         self.lambda1 = lambda1
@@ -36,9 +37,14 @@ class CombinedLoss(nn.Module):
         self.is_initialized = False
 
         self.margin_ranking_fn = nn.MarginRankingLoss(margin=self.margin, reduction="mean")
+        self.register_buffer(
+            "class_weights",
+            class_weights.detach().clone().float() if class_weights is not None else None,
+            persistent=False,
+        )
 
     def cross_entropy_loss(self, logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
-        return F.cross_entropy(logits, targets)
+        return F.cross_entropy(logits, targets, weight=self.class_weights)
 
     def mse_loss(self, pred: torch.Tensor, pred_prob: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
         pred_prob = F.softmax(pred, dim=1)

@@ -8,13 +8,18 @@ import pandas as pd
 import torch
 from sklearn.model_selection import train_test_split
 from torch.optim.lr_scheduler import CosineAnnealingWarmRestarts
-from torch.utils.data import DataLoader, RandomSampler
+from torch.utils.data import DataLoader, RandomSampler, SequentialSampler, WeightedRandomSampler
 from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
 from transformers import AutoTokenizer, RobertaConfig, RobertaForSequenceClassification
 
 from promptaes2.config import ConfigError, get_dataset_preset, validate_required_columns
 from promptaes2.utils.checkpoint import EarlyStopping, build_checkpoint_name
+from promptaes2.utils.imbalance import (
+    build_class_weight_tensor,
+    build_weighted_sampler,
+    format_class_weight_summary,
+)
 from promptaes2.utils.metrics import calculate_accuracy_qwk
 
 
@@ -43,6 +48,10 @@ def _convert_dataframe_to_tensors(
     batch_size: int,
     cpu_workers: int,
     label_name: str,
+    label_to_index: dict[object, int],
+    *,
+    sampler: WeightedRandomSampler | None = None,
+    shuffle: bool = False,
 ) -> DataLoader:
     inputs = tokenizer(
         data["text"].tolist(),
@@ -53,15 +62,20 @@ def _convert_dataframe_to_tensors(
     )
 
     labels_raw = data[label_name].tolist()
-    min_label = min(labels_raw)
-    labels_normalized = [int(label - min_label) for label in labels_raw]
+    labels_normalized = [label_to_index[label] for label in labels_raw]
     labels = torch.tensor(labels_normalized).long()
 
     dataset = torch.utils.data.TensorDataset(inputs.input_ids, inputs.attention_mask, labels)
+    if sampler is not None:
+        data_sampler = sampler
+    elif shuffle:
+        data_sampler = RandomSampler(dataset)
+    else:
+        data_sampler = SequentialSampler(dataset)
     return DataLoader(
         dataset,
         batch_size=batch_size,
-        sampler=RandomSampler(dataset),
+        sampler=data_sampler,
         num_workers=cpu_workers,
     )
 
@@ -163,7 +177,7 @@ def _split_by_predefined_column(
     return split_frames["train"], split_frames["val"], split_frames["test"]
 
 
-def _train_epoch(model, dataloader: DataLoader, optimizer, device: torch.device) -> tuple[float, float, float]:
+def _train_epoch(model, dataloader: DataLoader, optimizer, criterion, device: torch.device) -> tuple[float, float, float]:
     model.train()
     total_loss = 0.0
     all_labels: list[int] = []
@@ -173,8 +187,8 @@ def _train_epoch(model, dataloader: DataLoader, optimizer, device: torch.device)
         inputs, masks, labels = [item.to(device) for item in batch]
 
         optimizer.zero_grad()
-        outputs = model(input_ids=inputs, attention_mask=masks, labels=labels)
-        loss = outputs.loss
+        outputs = model(input_ids=inputs, attention_mask=masks)
+        loss = criterion(outputs.logits, labels)
         loss.backward()
         optimizer.step()
 
@@ -189,7 +203,7 @@ def _train_epoch(model, dataloader: DataLoader, optimizer, device: torch.device)
     return total_loss / len(dataloader), accuracy, qwk
 
 
-def _validate_epoch(model, dataloader: DataLoader, device: torch.device) -> tuple[float, float, float]:
+def _validate_epoch(model, dataloader: DataLoader, criterion, device: torch.device) -> tuple[float, float, float]:
     model.eval()
     total_loss = 0.0
     all_labels: list[int] = []
@@ -198,8 +212,9 @@ def _validate_epoch(model, dataloader: DataLoader, device: torch.device) -> tupl
     with torch.no_grad():
         for batch in dataloader:
             inputs, masks, labels = [item.to(device) for item in batch]
-            outputs = model(input_ids=inputs, attention_mask=masks, labels=labels)
-            total_loss += float(outputs.loss.item())
+            outputs = model(input_ids=inputs, attention_mask=masks)
+            loss = criterion(outputs.logits, labels)
+            total_loss += float(loss.item())
 
             predictions = torch.argmax(outputs.logits, dim=1).cpu().numpy().tolist()
             labels_np = labels.cpu().numpy().tolist()
@@ -256,6 +271,8 @@ def _maybe_init_wandb(
             "epochs": int(getattr(args, "epochs", 20)),
             "auto_stop": bool(getattr(args, "auto_stop", False)),
             "early_stopping_patience": int(getattr(args, "early_stopping_patience", 5)),
+            "imbalance_mitigation": bool(getattr(args, "imbalance_mitigation", False)),
+            "imbalance_max_weight": float(getattr(args, "imbalance_max_weight", 5.0)),
         },
     )
     return run
@@ -338,6 +355,8 @@ def _train_traits_on_partition(
     scheduler_eta_min = float(getattr(args, "scheduler_eta_min", 1e-6))
     print_epoch_metrics = bool(getattr(args, "print_epoch_metrics", False))
     predefined_split_column = getattr(args, "predefined_split_column", None)
+    imbalance_mitigation = bool(getattr(args, "imbalance_mitigation", False))
+    imbalance_max_weight = float(getattr(args, "imbalance_max_weight", 5.0))
 
     final_results: dict[str, dict[str, float | int]] = {}
     for trait_name in traits:
@@ -352,6 +371,7 @@ def _train_traits_on_partition(
 
         unique_labels = sorted(selected_data[trait_name].unique())
         unique_label_count = len(unique_labels)
+        label_to_index = {label: idx for idx, label in enumerate(unique_labels)}
         if unique_label_count < 2:
             print(f"Skipping '{trait_name}': requires at least 2 unique labels.")
             continue
@@ -387,6 +407,32 @@ def _train_traits_on_partition(
 
         _print_split_distributions(trait_name, train_data, val_data, test_data)
 
+        criterion = torch.nn.CrossEntropyLoss().to(device)
+        train_sampler: WeightedRandomSampler | None = None
+        if imbalance_mitigation:
+            train_labels = np.array([label_to_index[label] for label in train_data[trait_name].tolist()], dtype=np.int64)
+            class_weights, counts = build_class_weight_tensor(
+                train_labels,
+                num_classes=unique_label_count,
+                max_weight=imbalance_max_weight,
+                device=device,
+            )
+            criterion = torch.nn.CrossEntropyLoss(weight=class_weights).to(device)
+            train_sampler, weights_np, counts_np = build_weighted_sampler(
+                train_labels,
+                num_classes=unique_label_count,
+                max_weight=imbalance_max_weight,
+            )
+            class_names = [str(label) for label in unique_labels]
+            print(
+                "Imbalance mitigation: enabled "
+                f"(max_weight={imbalance_max_weight:.2f})"
+            )
+            print(
+                "Train class weights: "
+                + format_class_weight_summary(counts_np, weights_np, class_labels=class_names)
+            )
+
         try:
             model_config = RobertaConfig.from_pretrained(model_name, num_labels=unique_label_count)
             model = RobertaForSequenceClassification.from_pretrained(model_name, config=model_config)
@@ -416,6 +462,9 @@ def _train_traits_on_partition(
             args.batch_size,
             args.cpu_workers,
             trait_name,
+            label_to_index,
+            sampler=train_sampler,
+            shuffle=train_sampler is None,
         )
         val_loader = _convert_dataframe_to_tensors(
             val_data,
@@ -424,6 +473,7 @@ def _train_traits_on_partition(
             args.batch_size,
             args.cpu_workers,
             trait_name,
+            label_to_index,
         )
         test_loader = _convert_dataframe_to_tensors(
             test_data,
@@ -432,6 +482,7 @@ def _train_traits_on_partition(
             args.batch_size,
             args.cpu_workers,
             trait_name,
+            label_to_index,
         )
 
         checkpoint_name = build_checkpoint_name(args.dataset, "trait", trait_name)
@@ -466,8 +517,8 @@ def _train_traits_on_partition(
         print(f"\nTraining trait: {trait_name} ({unique_label_count} classes)")
         try:
             for epoch in range(epochs):
-                train_loss, train_acc, train_qwk = _train_epoch(model, train_loader, optimizer, device)
-                val_loss, val_acc, val_qwk = _validate_epoch(model, val_loader, device)
+                train_loss, train_acc, train_qwk = _train_epoch(model, train_loader, optimizer, criterion, device)
+                val_loss, val_acc, val_qwk = _validate_epoch(model, val_loader, criterion, device)
                 if scheduler is not None:
                     scheduler.step(epoch + 1)
                 current_lr = optimizer.param_groups[0]["lr"]
@@ -516,7 +567,7 @@ def _train_traits_on_partition(
                 )
 
             model.load_state_dict(torch.load(checkpoint_path, map_location=device))
-            test_loss, test_acc, test_qwk = _validate_epoch(model, test_loader, device)
+            test_loss, test_acc, test_qwk = _validate_epoch(model, test_loader, criterion, device)
 
             model_name_out = build_checkpoint_name(args.dataset, "trait_model", trait_name)
             model_output_path = output_dir / model_name_out
@@ -610,6 +661,11 @@ def run_trait_pretrain(args):
     print(f"Epochs: {epochs}")
     print(f"Scheduler: {scheduler_type}")
     print(f"Auto stop: {auto_stop} (patience={early_stopping_patience})")
+    print(
+        "Imbalance mitigation: "
+        f"{bool(getattr(args, 'imbalance_mitigation', False))} "
+        f"(max_weight={float(getattr(args, 'imbalance_max_weight', 5.0)):.2f})"
+    )
     print(f"Print epoch metrics: {print_epoch_metrics}")
     print(f"W&B logging: {use_wandb}")
     if use_wandb:
