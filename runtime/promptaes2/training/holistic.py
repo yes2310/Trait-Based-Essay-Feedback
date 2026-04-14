@@ -335,6 +335,63 @@ def _print_split_distributions(
     print(f"Test  distribution: {_format_label_distribution(test_labels)}")
 
 
+_PREDEFINED_SPLIT_ALIASES = {
+    "train": "train",
+    "dev": "val",
+    "val": "val",
+    "valid": "val",
+    "validation": "val",
+    "test": "test",
+}
+
+
+def _normalize_predefined_split_value(value) -> str | None:
+    if pd.isna(value):
+        return None
+    normalized = str(value).strip().lower()
+    if not normalized:
+        return None
+    return _PREDEFINED_SPLIT_ALIASES.get(normalized)
+
+
+def _build_predefined_split_indices(
+    essay: pd.DataFrame,
+    split_column: str,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    normalized_splits = essay[split_column].map(_normalize_predefined_split_value)
+    invalid_mask = normalized_splits.isna()
+    if invalid_mask.any():
+        invalid_values = sorted(
+            {
+                "NaN" if pd.isna(raw_value) else str(raw_value)
+                for raw_value in essay.loc[invalid_mask, split_column]
+            }
+        )
+        invalid_text = ", ".join(invalid_values)
+        raise ConfigError(
+            f"Predefined split column '{split_column}' contains invalid values: {invalid_text}. "
+            "Expected train/dev/test (or val/valid/validation)."
+        )
+
+    split_values = normalized_splits.to_numpy(dtype=object)
+    train_idx = np.flatnonzero(split_values == "train")
+    val_idx = np.flatnonzero(split_values == "val")
+    test_idx = np.flatnonzero(split_values == "test")
+
+    missing_splits = [
+        split_name
+        for split_name, split_indices in (("train", train_idx), ("val", val_idx), ("test", test_idx))
+        if len(split_indices) == 0
+    ]
+    if missing_splits:
+        missing_text = ", ".join(missing_splits)
+        raise ConfigError(
+            f"Predefined split column '{split_column}' is missing {missing_text} rows."
+        )
+
+    return train_idx, val_idx, test_idx
+
+
 def _maybe_init_wandb(args, run_name_override: str | None = None):
     if not args.use_wandb:
         return None
@@ -362,6 +419,7 @@ def _maybe_init_wandb(args, run_name_override: str | None = None):
             "train_ratio": args.train_ratio,
             "val_ratio": args.val_ratio,
             "test_ratio": args.test_ratio,
+            "predefined_split_column": getattr(args, "predefined_split_column", None),
             "epochs": args.epochs,
             "moe_aux_weight": moe_aux_weight,
             "model_variant": getattr(args, "model_variant", "legacy"),
@@ -398,6 +456,7 @@ def _print_holistic_startup_info(args) -> None:
     npz_path = getattr(args, "npz_path", None)
     trait_checkpoint_dir = getattr(args, "trait_checkpoint_dir", None)
     split_by_column = getattr(args, "split_by_column", None)
+    predefined_split_column = getattr(args, "predefined_split_column", None)
 
     print("\n" + "=" * 100, flush=True)
     print("HOLISTIC TRAINING STARTUP", flush=True)
@@ -415,10 +474,13 @@ def _print_holistic_startup_info(args) -> None:
         ),
         flush=True,
     )
-    print(
-        f"Split ratios: train={args.train_ratio:.2f}, val={args.val_ratio:.2f}, test={args.test_ratio:.2f}",
-        flush=True,
-    )
+    if predefined_split_column is None:
+        print(
+            f"Split ratios: train={args.train_ratio:.2f}, val={args.val_ratio:.2f}, test={args.test_ratio:.2f}",
+            flush=True,
+        )
+    else:
+        print(f"Predefined split column: {predefined_split_column}", flush=True)
     print(f"Split by column: {split_by_column if split_by_column is not None else 'none'}", flush=True)
     print(f"Ablation mode: {getattr(args, 'ablation_mode', 'none')}", flush=True)
     print(f"Backbone mode: {getattr(args, 'backbone_mode', 'frozen')}", flush=True)
@@ -576,30 +638,33 @@ def _run_single_holistic_training(
     )
 
     unique_labels_count = len(unique_labels)
-    indices = np.arange(len(labels))
+    predefined_split_column = getattr(args, "predefined_split_column", None)
+    if predefined_split_column is not None:
+        train_idx, val_idx, test_idx = _build_predefined_split_indices(essay, predefined_split_column)
+    else:
+        indices = np.arange(len(labels))
+        holdout_ratio = float(args.val_ratio + args.test_ratio)
+        test_ratio_within_holdout = float(args.test_ratio / holdout_ratio)
 
-    holdout_ratio = float(args.val_ratio + args.test_ratio)
-    test_ratio_within_holdout = float(args.test_ratio / holdout_ratio)
-
-    try:
-        train_idx, holdout_idx = train_test_split(
-            indices,
-            test_size=holdout_ratio,
-            random_state=args.seed,
-            stratify=labels,
-        )
-        val_idx, test_idx = train_test_split(
-            holdout_idx,
-            test_size=test_ratio_within_holdout,
-            random_state=args.seed,
-            stratify=labels[holdout_idx],
-        )
-    except ValueError as exc:
-        raise ConfigError(
-            f"Stratified split failed ({exc}). "
-            f"Label distribution: {_format_label_distribution(labels_raw)}. "
-            "Ensure each label has enough samples for train/val/test."
-        ) from exc
+        try:
+            train_idx, holdout_idx = train_test_split(
+                indices,
+                test_size=holdout_ratio,
+                random_state=args.seed,
+                stratify=labels,
+            )
+            val_idx, test_idx = train_test_split(
+                holdout_idx,
+                test_size=test_ratio_within_holdout,
+                random_state=args.seed,
+                stratify=labels[holdout_idx],
+            )
+        except ValueError as exc:
+            raise ConfigError(
+                f"Stratified split failed ({exc}). "
+                f"Label distribution: {_format_label_distribution(labels_raw)}. "
+                "Ensure each label has enough samples for train/val/test."
+            ) from exc
 
     wandb_run_name = None
     if run_label is not None and getattr(args, "run_name", None):
@@ -612,10 +677,13 @@ def _run_single_holistic_training(
     print(f"Dataset: {args.dataset}")
     print(f"Aligned samples: {len(labels)}")
     print(f"Unique labels: {unique_labels_count}")
-    print(
-        "Split ratios: "
-        f"train={args.train_ratio:.2f}, val={args.val_ratio:.2f}, test={args.test_ratio:.2f}"
-    )
+    if predefined_split_column is None:
+        print(
+            "Split ratios: "
+            f"train={args.train_ratio:.2f}, val={args.val_ratio:.2f}, test={args.test_ratio:.2f}"
+        )
+    else:
+        print(f"Predefined split column: {predefined_split_column}")
     print(f"Anchor trait for CombinedLoss: {anchor_trait}")
     print(f"MoE auxiliary loss weight: {moe_aux_weight}")
     for message in binning_messages:
@@ -666,11 +734,11 @@ def _run_single_holistic_training(
     )
 
     if len(train_loader) == 0:
-        raise ConfigError("Train loader is empty. Reduce --batch_size or adjust split ratios.")
+        raise ConfigError("Train loader is empty. Reduce --batch_size or adjust split configuration.")
     if len(val_loader) == 0:
-        raise ConfigError("Validation loader is empty. Reduce --batch_size or adjust split ratios.")
+        raise ConfigError("Validation loader is empty. Reduce --batch_size or adjust split configuration.")
     if len(test_loader) == 0:
-        raise ConfigError("Test loader is empty. Reduce --batch_size or adjust split ratios.")
+        raise ConfigError("Test loader is empty. Reduce --batch_size or adjust split configuration.")
 
     try:
         model = build_scoring_model(
@@ -1080,29 +1148,33 @@ def _run_single_holistic_training_e2e(
     )
 
     unique_labels_count = len(unique_labels)
-    indices = np.arange(len(labels))
-    holdout_ratio = float(args.val_ratio + args.test_ratio)
-    test_ratio_within_holdout = float(args.test_ratio / holdout_ratio)
+    predefined_split_column = getattr(args, "predefined_split_column", None)
+    if predefined_split_column is not None:
+        train_idx, val_idx, test_idx = _build_predefined_split_indices(essay, predefined_split_column)
+    else:
+        indices = np.arange(len(labels))
+        holdout_ratio = float(args.val_ratio + args.test_ratio)
+        test_ratio_within_holdout = float(args.test_ratio / holdout_ratio)
 
-    try:
-        train_idx, holdout_idx = train_test_split(
-            indices,
-            test_size=holdout_ratio,
-            random_state=args.seed,
-            stratify=labels,
-        )
-        val_idx, test_idx = train_test_split(
-            holdout_idx,
-            test_size=test_ratio_within_holdout,
-            random_state=args.seed,
-            stratify=labels[holdout_idx],
-        )
-    except ValueError as exc:
-        raise ConfigError(
-            f"Stratified split failed ({exc}). "
-            f"Label distribution: {_format_label_distribution(labels_raw)}. "
-            "Ensure each label has enough samples for train/val/test."
-        ) from exc
+        try:
+            train_idx, holdout_idx = train_test_split(
+                indices,
+                test_size=holdout_ratio,
+                random_state=args.seed,
+                stratify=labels,
+            )
+            val_idx, test_idx = train_test_split(
+                holdout_idx,
+                test_size=test_ratio_within_holdout,
+                random_state=args.seed,
+                stratify=labels[holdout_idx],
+            )
+        except ValueError as exc:
+            raise ConfigError(
+                f"Stratified split failed ({exc}). "
+                f"Label distribution: {_format_label_distribution(labels_raw)}. "
+                "Ensure each label has enough samples for train/val/test."
+            ) from exc
 
     wandb_run_name = None
     if run_label is not None and getattr(args, "run_name", None):
@@ -1115,6 +1187,13 @@ def _run_single_holistic_training_e2e(
     print(f"Aligned samples: {len(labels)}")
     print(f"Unique labels: {unique_labels_count}")
     print(f"Backbone mode: e2e (lr={float(args.backbone_lr)}, unfreeze_epoch={int(args.unfreeze_epoch)})")
+    if predefined_split_column is None:
+        print(
+            "Split ratios: "
+            f"train={args.train_ratio:.2f}, val={args.val_ratio:.2f}, test={args.test_ratio:.2f}"
+        )
+    else:
+        print(f"Predefined split column: {predefined_split_column}")
     print(f"MoE auxiliary loss weight: {moe_aux_weight}")
     for message in binning_messages:
         print(message)
@@ -1164,11 +1243,11 @@ def _run_single_holistic_training_e2e(
     )
 
     if len(train_loader) == 0:
-        raise ConfigError("Train loader is empty. Reduce --batch_size or adjust split ratios.")
+        raise ConfigError("Train loader is empty. Reduce --batch_size or adjust split configuration.")
     if len(val_loader) == 0:
-        raise ConfigError("Validation loader is empty. Reduce --batch_size or adjust split ratios.")
+        raise ConfigError("Validation loader is empty. Reduce --batch_size or adjust split configuration.")
     if len(test_loader) == 0:
-        raise ConfigError("Test loader is empty. Reduce --batch_size or adjust split ratios.")
+        raise ConfigError("Test loader is empty. Reduce --batch_size or adjust split configuration.")
 
     tokenizer, trait_backbones = _load_trait_backbones_for_e2e(
         args,
@@ -1647,11 +1726,14 @@ def run_holistic_training(args):
     output_dir.mkdir(parents=True, exist_ok=True)
     device = torch.device(args.device if args.device else ("cuda:0" if torch.cuda.is_available() else "cpu"))
     split_by_column = getattr(args, "split_by_column", None)
+    predefined_split_column = getattr(args, "predefined_split_column", None)
     backbone_mode = str(getattr(args, "backbone_mode", "frozen"))
 
     trait_names = _trait_groups_to_names(args.trait_groups)
     if backbone_mode == "e2e":
         essay = pd.read_csv(args.csv_path)
+        if predefined_split_column is not None:
+            validate_required_columns(essay.columns, [predefined_split_column])
         if split_by_column is None:
             return _run_single_holistic_training_e2e(
                 args,
@@ -1660,7 +1742,10 @@ def run_holistic_training(args):
                 trait_names=trait_names,
             )
 
-        validate_required_columns(essay.columns, [split_by_column])
+        required_group_columns = [split_by_column]
+        if predefined_split_column is not None:
+            required_group_columns.append(predefined_split_column)
+        validate_required_columns(essay.columns, required_group_columns)
         grouped_results: dict[str, dict[str, object]] = {}
         skipped_groups: list[tuple[str, str]] = []
 
@@ -1721,6 +1806,8 @@ def run_holistic_training(args):
                 f"Trait embeddings missing for: {missing}. Available embeddings: {available}"
             )
         _validate_embedding_dimensions(embeddings_dict, expected_dim=int(args.embedding_dim))
+        if predefined_split_column is not None:
+            validate_required_columns(essay.columns, [predefined_split_column])
 
         if split_by_column is None:
             return _run_single_holistic_training(
@@ -1730,7 +1817,10 @@ def run_holistic_training(args):
                 output_dir=output_dir,
             )
 
-        validate_required_columns(essay.columns, [split_by_column])
+        required_group_columns = [split_by_column]
+        if predefined_split_column is not None:
+            required_group_columns.append(predefined_split_column)
+        validate_required_columns(essay.columns, required_group_columns)
         grouped_results = {}
         skipped_groups = []
 

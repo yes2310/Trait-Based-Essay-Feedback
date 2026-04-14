@@ -111,6 +111,58 @@ def _print_split_distributions(
     print(f"Test  distribution: {_format_label_distribution(test_data[trait_name])}")
 
 
+_PREDEFINED_SPLIT_ALIASES = {
+    "train": "train",
+    "dev": "val",
+    "val": "val",
+    "valid": "val",
+    "validation": "val",
+    "test": "test",
+}
+
+
+def _normalize_predefined_split_value(value) -> str | None:
+    if pd.isna(value):
+        return None
+    normalized = str(value).strip().lower()
+    if not normalized:
+        return None
+    return _PREDEFINED_SPLIT_ALIASES.get(normalized)
+
+
+def _split_by_predefined_column(
+    data: pd.DataFrame,
+    split_column: str,
+) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    normalized_splits = data[split_column].map(_normalize_predefined_split_value)
+    invalid_mask = normalized_splits.isna()
+    if invalid_mask.any():
+        invalid_values = sorted(
+            {
+                "NaN" if pd.isna(raw_value) else str(raw_value)
+                for raw_value in data.loc[invalid_mask, split_column]
+            }
+        )
+        invalid_text = ", ".join(invalid_values)
+        raise ConfigError(
+            f"Predefined split column '{split_column}' contains invalid values: {invalid_text}. "
+            "Expected train/dev/test (or val/valid/validation)."
+        )
+
+    split_frames = {
+        split_name: data.loc[normalized_splits == split_name].copy()
+        for split_name in ("train", "val", "test")
+    }
+    missing_splits = [split_name for split_name, split_data in split_frames.items() if split_data.empty]
+    if missing_splits:
+        missing_text = ", ".join(missing_splits)
+        raise ValueError(
+            f"predefined split column '{split_column}' is missing {missing_text} rows after filtering"
+        )
+
+    return split_frames["train"], split_frames["val"], split_frames["test"]
+
+
 def _train_epoch(model, dataloader: DataLoader, optimizer, device: torch.device) -> tuple[float, float, float]:
     model.train()
     total_loss = 0.0
@@ -285,10 +337,14 @@ def _train_traits_on_partition(
     scheduler_tmult = int(getattr(args, "scheduler_tmult", 2))
     scheduler_eta_min = float(getattr(args, "scheduler_eta_min", 1e-6))
     print_epoch_metrics = bool(getattr(args, "print_epoch_metrics", False))
+    predefined_split_column = getattr(args, "predefined_split_column", None)
 
     final_results: dict[str, dict[str, float | int]] = {}
     for trait_name in traits:
-        selected_data = data[["text", trait_name]].dropna()
+        selected_columns = ["text", trait_name]
+        if predefined_split_column is not None:
+            selected_columns.append(predefined_split_column)
+        selected_data = data[selected_columns].dropna(subset=["text", trait_name]).copy()
         _print_trait_data_summary(trait_name, selected_data, total_rows=len(data))
         if selected_data.empty:
             print(f"Skipping '{trait_name}': no non-null samples.")
@@ -301,22 +357,32 @@ def _train_traits_on_partition(
             continue
 
         try:
-            train_data, temp_data = train_test_split(
-                selected_data,
-                test_size=0.3,
-                random_state=args.seed,
-                stratify=selected_data[trait_name],
-            )
-            val_data, test_data = train_test_split(
-                temp_data,
-                test_size=0.5,
-                random_state=args.seed,
-                stratify=temp_data[trait_name],
-            )
+            if predefined_split_column is not None:
+                train_data, val_data, test_data = _split_by_predefined_column(
+                    selected_data,
+                    predefined_split_column,
+                )
+            else:
+                train_data, temp_data = train_test_split(
+                    selected_data,
+                    test_size=0.3,
+                    random_state=args.seed,
+                    stratify=selected_data[trait_name],
+                )
+                val_data, test_data = train_test_split(
+                    temp_data,
+                    test_size=0.5,
+                    random_state=args.seed,
+                    stratify=temp_data[trait_name],
+                )
         except ValueError as exc:
-            print(f"Skipping '{trait_name}': stratified split failed ({exc}).")
+            if predefined_split_column is not None:
+                print(f"Skipping '{trait_name}': predefined split failed ({exc}).")
+            else:
+                print(f"Skipping '{trait_name}': stratified split failed ({exc}).")
             print(f"Label distribution: {_format_label_distribution(selected_data[trait_name])}")
-            print("Hint: each label should have enough samples in train/val/test during stratified split.")
+            if predefined_split_column is None:
+                print("Hint: each label should have enough samples in train/val/test during stratified split.")
             continue
 
         _print_split_distributions(trait_name, train_data, val_data, test_data)
@@ -528,6 +594,7 @@ def run_trait_pretrain(args):
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     split_by_column = getattr(args, "split_by_column", None)
+    predefined_split_column = getattr(args, "predefined_split_column", None)
 
     epochs = int(getattr(args, "epochs", 20))
     auto_stop = bool(getattr(args, "auto_stop", False))
@@ -549,6 +616,8 @@ def run_trait_pretrain(args):
         print(f"W&B project: {getattr(args, 'wandb_project_name', 'promptaes2-trait')}")
     if split_by_column is not None:
         print(f"Split by column: {split_by_column}")
+    if predefined_split_column is not None:
+        print(f"Predefined split column: {predefined_split_column}")
     print(
         "Note: The Transformers log about newly initialized "
         "'classifier.*' weights is expected for trait-specific heads."
@@ -558,6 +627,8 @@ def run_trait_pretrain(args):
     required_columns = ["text", *traits]
     if split_by_column is not None:
         required_columns.append(split_by_column)
+    if predefined_split_column is not None:
+        required_columns.append(predefined_split_column)
     validate_required_columns(data.columns, required_columns)
 
     tokenizer = _load_tokenizer_and_model_name(model_name)

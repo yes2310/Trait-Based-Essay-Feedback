@@ -69,6 +69,64 @@ def _print_split_distributions(train_labels: np.ndarray, val_labels: np.ndarray,
     print(f"Test  distribution: {_format_label_distribution(test_labels)}")
 
 
+_PREDEFINED_SPLIT_ALIASES = {
+    "train": "train",
+    "dev": "val",
+    "val": "val",
+    "valid": "val",
+    "validation": "val",
+    "test": "test",
+}
+
+
+def _normalize_predefined_split_value(value) -> str | None:
+    if pd.isna(value):
+        return None
+    normalized = str(value).strip().lower()
+    if not normalized:
+        return None
+    return _PREDEFINED_SPLIT_ALIASES.get(normalized)
+
+
+def _build_predefined_split_indices(
+    split_values: pd.Series,
+    *,
+    split_column: str,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    normalized_splits = split_values.map(_normalize_predefined_split_value)
+    invalid_mask = normalized_splits.isna()
+    if invalid_mask.any():
+        invalid_values = sorted(
+            {
+                "NaN" if pd.isna(raw_value) else str(raw_value)
+                for raw_value in split_values[invalid_mask]
+            }
+        )
+        invalid_text = ", ".join(invalid_values)
+        raise ConfigError(
+            f"Predefined split column '{split_column}' contains invalid values: {invalid_text}. "
+            "Expected train/dev/test (or val/valid/validation)."
+        )
+
+    split_array = normalized_splits.to_numpy(dtype=object)
+    train_idx = np.flatnonzero(split_array == "train")
+    val_idx = np.flatnonzero(split_array == "val")
+    test_idx = np.flatnonzero(split_array == "test")
+
+    missing_splits = [
+        split_name
+        for split_name, split_indices in (("train", train_idx), ("val", val_idx), ("test", test_idx))
+        if len(split_indices) == 0
+    ]
+    if missing_splits:
+        missing_text = ", ".join(missing_splits)
+        raise ValueError(
+            f"predefined split column '{split_column}' is missing {missing_text} rows after filtering"
+        )
+
+    return train_idx, val_idx, test_idx
+
+
 def _maybe_init_wandb(args, target_trait: str):
     if not bool(getattr(args, "use_wandb", False)):
         return None
@@ -99,6 +157,7 @@ def _maybe_init_wandb(args, target_trait: str):
             "train_ratio": args.train_ratio,
             "val_ratio": args.val_ratio,
             "test_ratio": args.test_ratio,
+            "predefined_split_column": getattr(args, "predefined_split_column", None),
             "moe_aux_weight": args.moe_aux_weight,
             "model_variant": getattr(args, "model_variant", "legacy"),
             "group_num_experts": int(getattr(args, "group_num_experts", 8)),
@@ -278,10 +337,11 @@ def run_trait_score_training(args):
             f"Target traits must be included in --trait_groups. Invalid targets: {invalid_text}"
         )
 
-    holdout_ratio = float(args.val_ratio + args.test_ratio)
-    test_ratio_within_holdout = float(args.test_ratio / holdout_ratio)
     moe_aux_weight = float(getattr(args, "moe_aux_weight", 0.01))
     save_checkpoints = bool(getattr(args, "save_checkpoints", True))
+    predefined_split_column = getattr(args, "predefined_split_column", None)
+    if predefined_split_column is not None:
+        validate_required_columns(essay.columns, [predefined_split_column])
 
     print(f"Dataset: {args.dataset}")
     print(f"Mode: trait-score")
@@ -306,10 +366,13 @@ def run_trait_score_training(args):
         f"pre_hetero={bool(getattr(args, 'use_pre_hetero_skip', False))}"
     )
     print(f"Save checkpoints: {save_checkpoints}")
-    print(
-        "Split ratios: "
-        f"train={args.train_ratio:.2f}, val={args.val_ratio:.2f}, test={args.test_ratio:.2f}"
-    )
+    if predefined_split_column is None:
+        print(
+            "Split ratios: "
+            f"train={args.train_ratio:.2f}, val={args.val_ratio:.2f}, test={args.test_ratio:.2f}"
+        )
+    else:
+        print(f"Predefined split column: {predefined_split_column}")
     print(f"Output dir: {output_dir}")
 
     final_results: dict[str, dict[str, float | int]] = {}
@@ -334,23 +397,37 @@ def run_trait_score_training(args):
         label_mapping = {old: new for new, old in enumerate(sorted(unique_labels))}
         labels = np.array([label_mapping[label] for label in trait_labels_raw])
 
-        indices = np.arange(len(labels))
         try:
-            train_idx, holdout_idx = train_test_split(
-                indices,
-                test_size=holdout_ratio,
-                random_state=args.seed,
-                stratify=labels,
-            )
-            val_idx, test_idx = train_test_split(
-                holdout_idx,
-                test_size=test_ratio_within_holdout,
-                random_state=args.seed,
-                stratify=labels[holdout_idx],
-            )
+            if predefined_split_column is not None:
+                split_values = essay.iloc[valid_indices][predefined_split_column].reset_index(drop=True)
+                train_idx, val_idx, test_idx = _build_predefined_split_indices(
+                    split_values,
+                    split_column=predefined_split_column,
+                )
+            else:
+                holdout_ratio = float(args.val_ratio + args.test_ratio)
+                test_ratio_within_holdout = float(args.test_ratio / holdout_ratio)
+                indices = np.arange(len(labels))
+                train_idx, holdout_idx = train_test_split(
+                    indices,
+                    test_size=holdout_ratio,
+                    random_state=args.seed,
+                    stratify=labels,
+                )
+                val_idx, test_idx = train_test_split(
+                    holdout_idx,
+                    test_size=test_ratio_within_holdout,
+                    random_state=args.seed,
+                    stratify=labels[holdout_idx],
+                )
         except ValueError as exc:
-            skipped_traits.append((target_trait, f"stratified split failed ({exc})"))
-            print(f"Skipping '{target_trait}': stratified split failed ({exc}).")
+            reason = (
+                f"predefined split failed ({exc})"
+                if predefined_split_column is not None
+                else f"stratified split failed ({exc})"
+            )
+            skipped_traits.append((target_trait, reason))
+            print(f"Skipping '{target_trait}': {reason}.")
             print(f"Label distribution: {_format_label_distribution(trait_labels_raw)}")
             continue
 

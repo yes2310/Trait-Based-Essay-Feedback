@@ -18,6 +18,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--data_path", type=str, default=None)
     parser.add_argument("--model_name", type=str, default=None)
     parser.add_argument("--split_by_column", type=str, default=None)
+    parser.add_argument("--predefined_split_column", type=str, default=None)
 
     parser.add_argument("--batch_size", type=int, default=16)
     parser.add_argument("--learning_rate", type=float, default=5e-5)
@@ -45,6 +46,16 @@ def _validate_parsed_args(args, parser: argparse.ArgumentParser) -> None:
         args.split_by_column = args.split_by_column.strip()
         if not args.split_by_column:
             parser.error("--split_by_column must not be empty")
+    if args.predefined_split_column is not None:
+        args.predefined_split_column = args.predefined_split_column.strip()
+        if not args.predefined_split_column:
+            parser.error("--predefined_split_column must not be empty")
+    if (
+        args.split_by_column is not None
+        and args.predefined_split_column is not None
+        and args.split_by_column == args.predefined_split_column
+    ):
+        parser.error("--split_by_column and --predefined_split_column must refer to different columns")
 
     if args.epochs is None:
         args.epochs = 200 if args.auto_stop else 20

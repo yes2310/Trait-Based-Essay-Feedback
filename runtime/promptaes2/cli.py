@@ -23,6 +23,7 @@ def _add_holistic_parser(subparsers):
     parser.add_argument("--csv_path", type=str, required=True)
     parser.add_argument("--trait_groups", type=str, required=True)
     parser.add_argument("--split_by_column", type=str, default=None)
+    parser.add_argument("--predefined_split_column", type=str, default=None)
     parser.add_argument("--trait_checkpoint_dir", type=str, default=None)
     parser.add_argument("--trait_model_name", type=str, default=None)
     parser.add_argument("--embedding_batch_size", type=int, default=32)
@@ -121,6 +122,7 @@ def _add_trait_score_parser(subparsers):
     parser.add_argument("--target_traits", nargs="+", required=True)
 
     parser.add_argument("--npz_path", type=str, default=None)
+    parser.add_argument("--predefined_split_column", type=str, default=None)
     parser.add_argument("--trait_checkpoint_dir", type=str, default=None)
     parser.add_argument("--trait_model_name", type=str, default=None)
     parser.add_argument("--embedding_batch_size", type=int, default=32)
@@ -226,6 +228,18 @@ def _validate_parsed_args(args, parser):
             if not split_by_column:
                 parser.error("--split_by_column must not be empty")
             args.split_by_column = split_by_column
+        predefined_split_column = getattr(args, "predefined_split_column", None)
+        if predefined_split_column is not None:
+            predefined_split_column = predefined_split_column.strip()
+            if not predefined_split_column:
+                parser.error("--predefined_split_column must not be empty")
+            args.predefined_split_column = predefined_split_column
+        if (
+            split_by_column is not None
+            and predefined_split_column is not None
+            and split_by_column == predefined_split_column
+        ):
+            parser.error("--split_by_column and --predefined_split_column must refer to different columns")
         try:
             args.hidden_sizes = parse_hidden_sizes(args.hidden_sizes)
             args.dropout_rates = parse_dropout_rates(args.dropout)
@@ -233,17 +247,18 @@ def _validate_parsed_args(args, parser):
         except ConfigError as exc:
             parser.error(str(exc))
 
-        split_ratios = {
-            "train": args.train_ratio,
-            "val": args.val_ratio,
-            "test": args.test_ratio,
-        }
-        for split_name, split_ratio in split_ratios.items():
-            if split_ratio <= 0 or split_ratio >= 1:
-                parser.error(f"--{split_name}_ratio must be > 0 and < 1")
-        ratio_sum = args.train_ratio + args.val_ratio + args.test_ratio
-        if abs(ratio_sum - 1.0) > 1e-6:
-            parser.error("--train_ratio + --val_ratio + --test_ratio must equal 1.0")
+        if predefined_split_column is None:
+            split_ratios = {
+                "train": args.train_ratio,
+                "val": args.val_ratio,
+                "test": args.test_ratio,
+            }
+            for split_name, split_ratio in split_ratios.items():
+                if split_ratio <= 0 or split_ratio >= 1:
+                    parser.error(f"--{split_name}_ratio must be > 0 and < 1")
+            ratio_sum = args.train_ratio + args.val_ratio + args.test_ratio
+            if abs(ratio_sum - 1.0) > 1e-6:
+                parser.error("--train_ratio + --val_ratio + --test_ratio must equal 1.0")
         if args.epochs < 1:
             parser.error("--epochs must be >= 1")
         if args.batch_size < 1:

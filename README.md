@@ -41,7 +41,8 @@
 
 참고:
 - 원본 CSV의 `split` 컬럼은 그대로 보존되어 있다
-- 현재 PromptAES2 학습 코드는 별도 확장을 하지 않으면 여전히 비율 기반 random split을 사용한다
+- 현재 실행 스크립트는 `--predefined_split_column split`을 전달해서 `split` 컬럼의 `train/dev/test`를 공식 분할로 그대로 사용한다
+- `split_by_column`은 여전히 group-by 용도이고, 공식 train/dev/test 분할에는 `--predefined_split_column`을 써야 한다
 - 실행 스크립트는 `uv` 가상환경의 Python과 로컬 `runtime/`를 사용하므로, 상위 PromptAES2 레포 위치에 의존하지 않는다
 - `uv`가 아직 없으면 먼저 설치해야 한다. 예: `python3 -m pip install uv`
 - LEAF의 `total_score`는 `12~14` 구간에 많이 몰려 있어서, 드문 점수 구간은 holistic 분류가 불안정할 수 있다
