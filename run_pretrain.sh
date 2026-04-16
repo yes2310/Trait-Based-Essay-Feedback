@@ -5,7 +5,7 @@ source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/_common.sh"
 
 run_workspace_python_module promptaes2.pretrain_cli \
   --dataset leaf \
-  --data_path "$WORKSPACE_DIR/data/leaf_merged.csv" \
+  --data_path "$WORKSPACE_DIR/data/leaf_merged_3class.csv" \
   --predefined_split_column split \
   --imbalance_mitigation \
   --imbalance_max_weight 5.0 \
@@ -13,4 +13,4 @@ run_workspace_python_module promptaes2.pretrain_cli \
   --epochs 5 \
   --batch_size 8 \
   --cpu_workers 0 \
-  --output_dir "$WORKSPACE_DIR/results/trait_pretrain"
+  --output_dir "$WORKSPACE_DIR/results/trait_pretrain_3class"

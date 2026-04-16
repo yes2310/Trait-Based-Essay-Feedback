@@ -5,6 +5,7 @@
 
 구성:
 - `data/leaf_merged.csv`: PromptAES2에서 사용할 수 있도록 정규화한 LEAF CSV
+- `data/leaf_merged_3class.csv`: trait 점수를 `1/2/3`으로 재매핑한 3-class LEAF CSV
 - `legacy_data/filtered_leaf3000.csv`: 예전에 루트 레포에 있던 LEAF 관련 보조 데이터
 - `runtime/promptaes2/`: 실행 스크립트가 사용하는 로컬 PromptAES2 런타임
 - `.venv/`: `uv`로 만든 로컬 가상환경
@@ -41,6 +42,7 @@
 
 참고:
 - 원본 CSV의 `split` 컬럼은 그대로 보존되어 있다
+- 현재 실행 스크립트는 `data/leaf_merged_3class.csv`를 사용하고, trait 점수는 `1,2 -> 1`, `3 -> 2`, `4,5 -> 3`으로 재매핑되어 있다
 - 현재 실행 스크립트는 `--predefined_split_column split`을 전달해서 `split` 컬럼의 `train/dev/test`를 공식 분할로 그대로 사용한다
 - `split_by_column`은 여전히 group-by 용도이고, 공식 train/dev/test 분할에는 `--predefined_split_column`을 써야 한다
 - 실행 스크립트는 `uv` 가상환경의 Python과 로컬 `runtime/`를 사용하므로, 상위 PromptAES2 레포 위치에 의존하지 않는다
