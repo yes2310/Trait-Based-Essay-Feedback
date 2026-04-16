@@ -54,9 +54,17 @@ def build_weighted_sampler(
     *,
     num_classes: int | None = None,
     max_weight: float | None = None,
+    power: float = 1.0,
 ) -> tuple[WeightedRandomSampler, np.ndarray, np.ndarray]:
     labels_np = np.asarray(labels, dtype=np.int64)
-    class_weights, counts = compute_class_weights(labels_np, num_classes=num_classes, max_weight=max_weight)
+    counts = compute_class_counts(labels_np, num_classes=num_classes)
+    class_weights = np.zeros(len(counts), dtype=np.float32)
+    present_mask = counts > 0
+    inverse = np.power(counts[present_mask].astype(np.float64), -float(power))
+    inverse /= inverse.mean()
+    if max_weight is not None:
+        inverse = np.minimum(inverse, float(max_weight))
+    class_weights[present_mask] = inverse.astype(np.float32)
     sample_weights = class_weights[labels_np].astype(np.float64)
     sampler = WeightedRandomSampler(
         weights=torch.tensor(sample_weights, dtype=torch.double),

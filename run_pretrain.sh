@@ -9,6 +9,7 @@ run_workspace_python_module promptaes2.pretrain_cli \
   --predefined_split_column split \
   --imbalance_mitigation \
   --imbalance_max_weight 5.0 \
+  --imbalance_sampler_power 1.5 \
   --traits alignment_with_topic spelling_grammar_style clarity_of_view_point arguments_supporting_details \
   --epochs 5 \
   --batch_size 8 \

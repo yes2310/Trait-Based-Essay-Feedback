@@ -8,7 +8,7 @@ import torch
 import torch.nn as nn
 from sklearn.model_selection import train_test_split
 from torch.optim.lr_scheduler import CosineAnnealingWarmRestarts
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, WeightedRandomSampler
 from tqdm.auto import tqdm
 
 from promptaes2.config import ConfigError, validate_required_columns
@@ -19,9 +19,14 @@ from promptaes2.training.holistic import _extract_embeddings_from_trait_checkpoi
 from promptaes2.utils.checkpoint import EarlyStopping, build_checkpoint_name
 from promptaes2.utils.imbalance import (
     build_class_weight_tensor,
+    build_weighted_sampler,
     format_class_weight_summary,
 )
-from promptaes2.utils.metrics import calculate_accuracy_qwk
+from promptaes2.utils.metrics import (
+    calculate_accuracy_qwk,
+    calculate_majority_baseline,
+    format_label_distribution,
+)
 
 
 def _set_seed(seed: int) -> None:
@@ -200,6 +205,7 @@ def _build_loader(
     args,
     *,
     shuffle: bool,
+    sampler: WeightedRandomSampler | None = None,
 ):
     subset_embeddings = {trait: emb[indices] for trait, emb in embeddings_dict.items()}
     subset_labels = labels[indices]
@@ -207,7 +213,8 @@ def _build_loader(
     return DataLoader(
         dataset,
         batch_size=args.batch_size,
-        shuffle=shuffle,
+        shuffle=shuffle if sampler is None else False,
+        sampler=sampler,
         drop_last=False,
         num_workers=args.cpu_workers,
     )
@@ -285,6 +292,8 @@ def _validate_one_epoch(model, loader: DataLoader, criterion, device: torch.devi
         aux_loss_total / len(loader),
         acc,
         qwk,
+        labels_all,
+        predictions,
     )
 
 
@@ -383,7 +392,8 @@ def run_trait_score_training(args):
     print(f"Save checkpoints: {save_checkpoints}")
     print(
         "Imbalance mitigation: "
-        f"{imbalance_mitigation} (max_weight={imbalance_max_weight:.2f})"
+        f"{imbalance_mitigation} (max_weight={imbalance_max_weight:.2f}, "
+        f"sampler_power={float(getattr(args, 'imbalance_sampler_power', 1.5)):.2f})"
     )
     if predefined_split_column is None:
         print(
@@ -455,6 +465,7 @@ def run_trait_score_training(args):
             for trait_name, emb in embeddings_dict.items()
         }
         criterion = nn.CrossEntropyLoss().to(device)
+        train_sampler: WeightedRandomSampler | None = None
         if imbalance_mitigation:
             class_weights, counts = build_class_weight_tensor(
                 labels[train_idx],
@@ -463,10 +474,20 @@ def run_trait_score_training(args):
                 device=device,
             )
             criterion = nn.CrossEntropyLoss(weight=class_weights).to(device)
+            train_sampler, sampler_weights, sampler_counts = build_weighted_sampler(
+                labels[train_idx],
+                num_classes=len(unique_labels),
+                max_weight=imbalance_max_weight,
+                power=float(getattr(args, "imbalance_sampler_power", 1.5)),
+            )
             class_names = [str(label) for label in sorted(unique_labels)]
             print(
                 "Train class weights: "
                 + format_class_weight_summary(counts, class_weights.detach().cpu().numpy(), class_labels=class_names)
+            )
+            print(
+                "Train sampler weights: "
+                + format_class_weight_summary(sampler_counts, sampler_weights, class_labels=class_names)
             )
 
         train_loader = _build_loader(
@@ -474,7 +495,8 @@ def run_trait_score_training(args):
             labels,
             train_idx,
             args,
-            shuffle=True,
+            shuffle=train_sampler is None,
+            sampler=train_sampler,
         )
         val_loader = _build_loader(trait_embeddings, labels, val_idx, args, shuffle=False)
         test_loader = _build_loader(trait_embeddings, labels, test_idx, args, shuffle=False)
@@ -554,7 +576,7 @@ def run_trait_score_training(args):
                     scheduler.step(epoch + 1)
                 lr = optimizer.param_groups[0]["lr"]
 
-                val_total, val_main, val_aux, val_acc, val_qwk = _validate_one_epoch(
+                val_total, val_main, val_aux, val_acc, val_qwk, _, _ = _validate_one_epoch(
                     model,
                     val_loader,
                     criterion,
@@ -628,12 +650,26 @@ def run_trait_score_training(args):
         else:
             model.load_state_dict(best_state_dict)
 
-        test_total, test_main, test_aux, test_acc, test_qwk = _validate_one_epoch(
+        test_total, test_main, test_aux, test_acc, test_qwk, test_labels, test_predictions = _validate_one_epoch(
             model,
             test_loader,
             criterion,
             device,
             moe_aux_weight,
+        )
+        class_names = [str(label) for label in sorted(unique_labels)]
+        majority_class, baseline_acc, baseline_qwk = calculate_majority_baseline(test_labels)
+        print(
+            "Test majority baseline: "
+            f"class={class_names[majority_class]}, acc={baseline_acc:.4f}, qwk={baseline_qwk:.4f}"
+        )
+        print(
+            "Test actual distribution: "
+            + format_label_distribution(test_labels, class_labels=class_names)
+        )
+        print(
+            "Test prediction distribution: "
+            + format_label_distribution(test_predictions, class_labels=class_names)
         )
 
         final_model_path = output_dir / build_checkpoint_name(args.dataset, "trait_score_model", target_trait)

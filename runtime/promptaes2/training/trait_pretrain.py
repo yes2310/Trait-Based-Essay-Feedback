@@ -8,7 +8,7 @@ import pandas as pd
 import torch
 from sklearn.model_selection import train_test_split
 from torch.optim.lr_scheduler import CosineAnnealingWarmRestarts
-from torch.utils.data import DataLoader, RandomSampler, SequentialSampler
+from torch.utils.data import DataLoader, RandomSampler, SequentialSampler, WeightedRandomSampler
 from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
 from transformers import AutoTokenizer, RobertaConfig, RobertaForSequenceClassification
@@ -17,9 +17,14 @@ from promptaes2.config import ConfigError, get_dataset_preset, validate_required
 from promptaes2.utils.checkpoint import EarlyStopping, build_checkpoint_name
 from promptaes2.utils.imbalance import (
     build_class_weight_tensor,
+    build_weighted_sampler,
     format_class_weight_summary,
 )
-from promptaes2.utils.metrics import calculate_accuracy_qwk
+from promptaes2.utils.metrics import (
+    calculate_accuracy_qwk,
+    calculate_majority_baseline,
+    format_label_distribution,
+)
 
 
 def _set_seed(seed: int) -> None:
@@ -49,6 +54,7 @@ def _convert_dataframe_to_tensors(
     label_name: str,
     label_to_index: dict[object, int],
     *,
+    sampler: WeightedRandomSampler | None = None,
     shuffle: bool = False,
 ) -> DataLoader:
     inputs = tokenizer(
@@ -64,7 +70,9 @@ def _convert_dataframe_to_tensors(
     labels = torch.tensor(labels_normalized).long()
 
     dataset = torch.utils.data.TensorDataset(inputs.input_ids, inputs.attention_mask, labels)
-    if shuffle:
+    if sampler is not None:
+        data_sampler = sampler
+    elif shuffle:
         data_sampler = RandomSampler(dataset)
     else:
         data_sampler = SequentialSampler(dataset)
@@ -199,7 +207,12 @@ def _train_epoch(model, dataloader: DataLoader, optimizer, criterion, device: to
     return total_loss / len(dataloader), accuracy, qwk
 
 
-def _validate_epoch(model, dataloader: DataLoader, criterion, device: torch.device) -> tuple[float, float, float]:
+def _validate_epoch(
+    model,
+    dataloader: DataLoader,
+    criterion,
+    device: torch.device,
+) -> tuple[float, float, float, list[int], list[int]]:
     model.eval()
     total_loss = 0.0
     all_labels: list[int] = []
@@ -219,7 +232,7 @@ def _validate_epoch(model, dataloader: DataLoader, criterion, device: torch.devi
             all_labels.extend(labels_np)
 
     accuracy, qwk = calculate_accuracy_qwk(all_labels, all_predictions)
-    return total_loss / len(dataloader), accuracy, qwk
+    return total_loss / len(dataloader), accuracy, qwk, all_labels, all_predictions
 
 
 def _resolve_traits_and_paths(args):
@@ -353,6 +366,7 @@ def _train_traits_on_partition(
     predefined_split_column = getattr(args, "predefined_split_column", None)
     imbalance_mitigation = bool(getattr(args, "imbalance_mitigation", False))
     imbalance_max_weight = float(getattr(args, "imbalance_max_weight", 5.0))
+    imbalance_sampler_power = float(getattr(args, "imbalance_sampler_power", 1.5))
 
     final_results: dict[str, dict[str, float | int]] = {}
     for trait_name in traits:
@@ -404,6 +418,7 @@ def _train_traits_on_partition(
         _print_split_distributions(trait_name, train_data, val_data, test_data)
 
         criterion = torch.nn.CrossEntropyLoss().to(device)
+        train_sampler: WeightedRandomSampler | None = None
         if imbalance_mitigation:
             train_labels = np.array([label_to_index[label] for label in train_data[trait_name].tolist()], dtype=np.int64)
             class_weights, counts = build_class_weight_tensor(
@@ -413,14 +428,24 @@ def _train_traits_on_partition(
                 device=device,
             )
             criterion = torch.nn.CrossEntropyLoss(weight=class_weights).to(device)
+            train_sampler, sampler_weights, sampler_counts = build_weighted_sampler(
+                train_labels,
+                num_classes=unique_label_count,
+                max_weight=imbalance_max_weight,
+                power=imbalance_sampler_power,
+            )
             class_names = [str(label) for label in unique_labels]
             print(
                 "Imbalance mitigation: enabled "
-                f"(max_weight={imbalance_max_weight:.2f})"
+                f"(max_weight={imbalance_max_weight:.2f}, sampler_power={imbalance_sampler_power:.2f})"
             )
             print(
                 "Train class weights: "
                 + format_class_weight_summary(counts, class_weights.detach().cpu().numpy(), class_labels=class_names)
+            )
+            print(
+                "Train sampler weights: "
+                + format_class_weight_summary(sampler_counts, sampler_weights, class_labels=class_names)
             )
 
         try:
@@ -453,7 +478,8 @@ def _train_traits_on_partition(
             args.cpu_workers,
             trait_name,
             label_to_index,
-            shuffle=True,
+            sampler=train_sampler,
+            shuffle=train_sampler is None,
         )
         val_loader = _convert_dataframe_to_tensors(
             val_data,
@@ -507,7 +533,7 @@ def _train_traits_on_partition(
         try:
             for epoch in range(epochs):
                 train_loss, train_acc, train_qwk = _train_epoch(model, train_loader, optimizer, criterion, device)
-                val_loss, val_acc, val_qwk = _validate_epoch(model, val_loader, criterion, device)
+                val_loss, val_acc, val_qwk, _, _ = _validate_epoch(model, val_loader, criterion, device)
                 if scheduler is not None:
                     scheduler.step(epoch + 1)
                 current_lr = optimizer.param_groups[0]["lr"]
@@ -556,7 +582,26 @@ def _train_traits_on_partition(
                 )
 
             model.load_state_dict(torch.load(checkpoint_path, map_location=device))
-            test_loss, test_acc, test_qwk = _validate_epoch(model, test_loader, criterion, device)
+            test_loss, test_acc, test_qwk, test_labels, test_predictions = _validate_epoch(
+                model,
+                test_loader,
+                criterion,
+                device,
+            )
+            class_names = [str(label) for label in unique_labels]
+            majority_class, baseline_acc, baseline_qwk = calculate_majority_baseline(test_labels)
+            print(
+                "Test majority baseline: "
+                f"class={class_names[majority_class]}, acc={baseline_acc:.4f}, qwk={baseline_qwk:.4f}"
+            )
+            print(
+                "Test actual distribution: "
+                + format_label_distribution(test_labels, class_labels=class_names)
+            )
+            print(
+                "Test prediction distribution: "
+                + format_label_distribution(test_predictions, class_labels=class_names)
+            )
 
             model_name_out = build_checkpoint_name(args.dataset, "trait_model", trait_name)
             model_output_path = output_dir / model_name_out
@@ -653,7 +698,8 @@ def run_trait_pretrain(args):
     print(
         "Imbalance mitigation: "
         f"{bool(getattr(args, 'imbalance_mitigation', False))} "
-        f"(max_weight={float(getattr(args, 'imbalance_max_weight', 5.0)):.2f})"
+        f"(max_weight={float(getattr(args, 'imbalance_max_weight', 5.0)):.2f}, "
+        f"sampler_power={float(getattr(args, 'imbalance_sampler_power', 1.5)):.2f})"
     )
     print(f"Print epoch metrics: {print_epoch_metrics}")
     print(f"W&B logging: {use_wandb}")

@@ -9,7 +9,7 @@ import torch
 import torch.nn as nn
 from sklearn.model_selection import train_test_split
 from torch.optim.lr_scheduler import CosineAnnealingWarmRestarts
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import DataLoader, Dataset, WeightedRandomSampler
 from tqdm.auto import tqdm
 
 from promptaes2.config import ConfigError, get_dataset_preset, validate_required_columns
@@ -20,9 +20,14 @@ from promptaes2.models.factory import build_scoring_model
 from promptaes2.utils.checkpoint import EarlyStopping, build_checkpoint_name
 from promptaes2.utils.imbalance import (
     build_class_weight_tensor,
+    build_weighted_sampler,
     format_class_weight_summary,
 )
-from promptaes2.utils.metrics import calculate_accuracy_qwk
+from promptaes2.utils.metrics import (
+    calculate_accuracy_qwk,
+    calculate_majority_baseline,
+    format_label_distribution,
+)
 
 
 class _HolisticTextDataset(Dataset):
@@ -426,6 +431,7 @@ def _maybe_init_wandb(args, run_name_override: str | None = None):
             "predefined_split_column": getattr(args, "predefined_split_column", None),
             "imbalance_mitigation": bool(getattr(args, "imbalance_mitigation", False)),
             "imbalance_max_weight": float(getattr(args, "imbalance_max_weight", 5.0)),
+            "imbalance_sampler_power": float(getattr(args, "imbalance_sampler_power", 1.5)),
             "epochs": args.epochs,
             "moe_aux_weight": moe_aux_weight,
             "model_variant": getattr(args, "model_variant", "legacy"),
@@ -503,7 +509,8 @@ def _print_holistic_startup_info(args) -> None:
     print(
         "Imbalance mitigation: "
         f"{bool(getattr(args, 'imbalance_mitigation', False))} "
-        f"(max_weight={float(getattr(args, 'imbalance_max_weight', 5.0)):.2f})",
+        f"(max_weight={float(getattr(args, 'imbalance_max_weight', 5.0)):.2f}, "
+        f"sampler_power={float(getattr(args, 'imbalance_sampler_power', 1.5)):.2f})",
         flush=True,
     )
     print(
@@ -710,6 +717,7 @@ def _run_single_holistic_training(
     imbalance_mitigation = bool(getattr(args, "imbalance_mitigation", False))
     imbalance_max_weight = float(getattr(args, "imbalance_max_weight", 5.0))
     class_weights: torch.Tensor | None = None
+    train_sampler: WeightedRandomSampler | None = None
     if imbalance_mitigation:
         class_weights, counts = build_class_weight_tensor(
             labels[train_idx],
@@ -717,10 +725,20 @@ def _run_single_holistic_training(
             max_weight=imbalance_max_weight,
             device=device,
         )
+        train_sampler, sampler_weights, sampler_counts = build_weighted_sampler(
+            labels[train_idx],
+            num_classes=unique_labels_count,
+            max_weight=imbalance_max_weight,
+            power=float(getattr(args, "imbalance_sampler_power", 1.5)),
+        )
         class_names = [str(label) for label in sorted(unique_labels)]
         print(
             "Train class weights: "
             + format_class_weight_summary(counts, class_weights.detach().cpu().numpy(), class_labels=class_names)
+        )
+        print(
+            "Train sampler weights: "
+            + format_class_weight_summary(sampler_counts, sampler_weights, class_labels=class_names)
         )
 
     train_dataset = MultiEmbeddingDataset(
@@ -742,7 +760,8 @@ def _run_single_holistic_training(
     train_loader = DataLoader(
         train_dataset,
         batch_size=args.batch_size,
-        shuffle=True,
+        shuffle=train_sampler is None,
+        sampler=train_sampler,
         drop_last=False,
         num_workers=args.cpu_workers,
     )
@@ -1107,6 +1126,20 @@ def _run_single_holistic_training(
     avg_test_main_loss = test_main_loss / len(test_loader)
     avg_test_aux_loss = test_aux_loss / len(test_loader)
     test_accuracy, test_qwk = calculate_accuracy_qwk(test_labels, test_predictions)
+    class_names = [str(label) for label in sorted(unique_labels)]
+    majority_class, baseline_acc, baseline_qwk = calculate_majority_baseline(test_labels)
+    print(
+        "Test majority baseline: "
+        f"class={class_names[majority_class]}, acc={baseline_acc:.4f}, qwk={baseline_qwk:.4f}"
+    )
+    print(
+        "Test actual distribution: "
+        + format_label_distribution(test_labels, class_labels=class_names)
+    )
+    print(
+        "Test prediction distribution: "
+        + format_label_distribution(test_predictions, class_labels=class_names)
+    )
 
     _log_wandb(
         run,
@@ -1236,6 +1269,7 @@ def _run_single_holistic_training_e2e(
     imbalance_mitigation = bool(getattr(args, "imbalance_mitigation", False))
     imbalance_max_weight = float(getattr(args, "imbalance_max_weight", 5.0))
     class_weights: torch.Tensor | None = None
+    train_sampler: WeightedRandomSampler | None = None
     if imbalance_mitigation:
         class_weights, counts = build_class_weight_tensor(
             labels[train_idx],
@@ -1243,10 +1277,20 @@ def _run_single_holistic_training_e2e(
             max_weight=imbalance_max_weight,
             device=device,
         )
+        train_sampler, sampler_weights, sampler_counts = build_weighted_sampler(
+            labels[train_idx],
+            num_classes=unique_labels_count,
+            max_weight=imbalance_max_weight,
+            power=float(getattr(args, "imbalance_sampler_power", 1.5)),
+        )
         class_names = [str(label) for label in sorted(unique_labels)]
         print(
             "Train class weights: "
             + format_class_weight_summary(counts, class_weights.detach().cpu().numpy(), class_labels=class_names)
+        )
+        print(
+            "Train sampler weights: "
+            + format_class_weight_summary(sampler_counts, sampler_weights, class_labels=class_names)
         )
 
     train_dataset = _HolisticTextDataset(
@@ -1268,7 +1312,8 @@ def _run_single_holistic_training_e2e(
     train_loader = DataLoader(
         train_dataset,
         batch_size=args.batch_size,
-        shuffle=True,
+        shuffle=train_sampler is None,
+        sampler=train_sampler,
         drop_last=False,
         num_workers=args.cpu_workers,
     )
@@ -1679,6 +1724,20 @@ def _run_single_holistic_training_e2e(
     avg_test_main_loss = test_main_loss / len(test_loader)
     avg_test_aux_loss = test_aux_loss / len(test_loader)
     test_accuracy, test_qwk = calculate_accuracy_qwk(test_labels, test_predictions)
+    class_names = [str(label) for label in sorted(unique_labels)]
+    majority_class, baseline_acc, baseline_qwk = calculate_majority_baseline(test_labels)
+    print(
+        "Test majority baseline: "
+        f"class={class_names[majority_class]}, acc={baseline_acc:.4f}, qwk={baseline_qwk:.4f}"
+    )
+    print(
+        "Test actual distribution: "
+        + format_label_distribution(test_labels, class_labels=class_names)
+    )
+    print(
+        "Test prediction distribution: "
+        + format_label_distribution(test_predictions, class_labels=class_names)
+    )
 
     _log_wandb(
         run,
