@@ -9,7 +9,7 @@ import torch
 import torch.nn as nn
 from sklearn.model_selection import train_test_split
 from torch.optim.lr_scheduler import CosineAnnealingWarmRestarts
-from torch.utils.data import DataLoader, Dataset, WeightedRandomSampler
+from torch.utils.data import DataLoader, Dataset
 from tqdm.auto import tqdm
 
 from promptaes2.config import ConfigError, get_dataset_preset, validate_required_columns
@@ -20,7 +20,6 @@ from promptaes2.models.factory import build_scoring_model
 from promptaes2.utils.checkpoint import EarlyStopping, build_checkpoint_name
 from promptaes2.utils.imbalance import (
     build_class_weight_tensor,
-    build_weighted_sampler,
     format_class_weight_summary,
 )
 from promptaes2.utils.metrics import calculate_accuracy_qwk
@@ -711,7 +710,6 @@ def _run_single_holistic_training(
     imbalance_mitigation = bool(getattr(args, "imbalance_mitigation", False))
     imbalance_max_weight = float(getattr(args, "imbalance_max_weight", 5.0))
     class_weights: torch.Tensor | None = None
-    train_sampler: WeightedRandomSampler | None = None
     if imbalance_mitigation:
         class_weights, counts = build_class_weight_tensor(
             labels[train_idx],
@@ -719,15 +717,10 @@ def _run_single_holistic_training(
             max_weight=imbalance_max_weight,
             device=device,
         )
-        train_sampler, weights_np, counts_np = build_weighted_sampler(
-            labels[train_idx],
-            num_classes=unique_labels_count,
-            max_weight=imbalance_max_weight,
-        )
         class_names = [str(label) for label in sorted(unique_labels)]
         print(
             "Train class weights: "
-            + format_class_weight_summary(counts_np, weights_np, class_labels=class_names)
+            + format_class_weight_summary(counts, class_weights.detach().cpu().numpy(), class_labels=class_names)
         )
 
     train_dataset = MultiEmbeddingDataset(
@@ -749,8 +742,7 @@ def _run_single_holistic_training(
     train_loader = DataLoader(
         train_dataset,
         batch_size=args.batch_size,
-        shuffle=train_sampler is None,
-        sampler=train_sampler,
+        shuffle=True,
         drop_last=False,
         num_workers=args.cpu_workers,
     )
@@ -1244,7 +1236,6 @@ def _run_single_holistic_training_e2e(
     imbalance_mitigation = bool(getattr(args, "imbalance_mitigation", False))
     imbalance_max_weight = float(getattr(args, "imbalance_max_weight", 5.0))
     class_weights: torch.Tensor | None = None
-    train_sampler: WeightedRandomSampler | None = None
     if imbalance_mitigation:
         class_weights, counts = build_class_weight_tensor(
             labels[train_idx],
@@ -1252,15 +1243,10 @@ def _run_single_holistic_training_e2e(
             max_weight=imbalance_max_weight,
             device=device,
         )
-        train_sampler, weights_np, counts_np = build_weighted_sampler(
-            labels[train_idx],
-            num_classes=unique_labels_count,
-            max_weight=imbalance_max_weight,
-        )
         class_names = [str(label) for label in sorted(unique_labels)]
         print(
             "Train class weights: "
-            + format_class_weight_summary(counts_np, weights_np, class_labels=class_names)
+            + format_class_weight_summary(counts, class_weights.detach().cpu().numpy(), class_labels=class_names)
         )
 
     train_dataset = _HolisticTextDataset(
@@ -1282,8 +1268,7 @@ def _run_single_holistic_training_e2e(
     train_loader = DataLoader(
         train_dataset,
         batch_size=args.batch_size,
-        shuffle=train_sampler is None,
-        sampler=train_sampler,
+        shuffle=True,
         drop_last=False,
         num_workers=args.cpu_workers,
     )

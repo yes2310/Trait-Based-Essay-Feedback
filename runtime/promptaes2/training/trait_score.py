@@ -8,7 +8,7 @@ import torch
 import torch.nn as nn
 from sklearn.model_selection import train_test_split
 from torch.optim.lr_scheduler import CosineAnnealingWarmRestarts
-from torch.utils.data import DataLoader, WeightedRandomSampler
+from torch.utils.data import DataLoader
 from tqdm.auto import tqdm
 
 from promptaes2.config import ConfigError, validate_required_columns
@@ -19,7 +19,6 @@ from promptaes2.training.holistic import _extract_embeddings_from_trait_checkpoi
 from promptaes2.utils.checkpoint import EarlyStopping, build_checkpoint_name
 from promptaes2.utils.imbalance import (
     build_class_weight_tensor,
-    build_weighted_sampler,
     format_class_weight_summary,
 )
 from promptaes2.utils.metrics import calculate_accuracy_qwk
@@ -201,7 +200,6 @@ def _build_loader(
     args,
     *,
     shuffle: bool,
-    sampler: WeightedRandomSampler | None = None,
 ):
     subset_embeddings = {trait: emb[indices] for trait, emb in embeddings_dict.items()}
     subset_labels = labels[indices]
@@ -209,8 +207,7 @@ def _build_loader(
     return DataLoader(
         dataset,
         batch_size=args.batch_size,
-        shuffle=shuffle if sampler is None else False,
-        sampler=sampler,
+        shuffle=shuffle,
         drop_last=False,
         num_workers=args.cpu_workers,
     )
@@ -457,7 +454,6 @@ def run_trait_score_training(args):
             trait_name: emb[valid_indices]
             for trait_name, emb in embeddings_dict.items()
         }
-        train_sampler: WeightedRandomSampler | None = None
         criterion = nn.CrossEntropyLoss().to(device)
         if imbalance_mitigation:
             class_weights, counts = build_class_weight_tensor(
@@ -467,15 +463,10 @@ def run_trait_score_training(args):
                 device=device,
             )
             criterion = nn.CrossEntropyLoss(weight=class_weights).to(device)
-            train_sampler, weights_np, counts_np = build_weighted_sampler(
-                labels[train_idx],
-                num_classes=len(unique_labels),
-                max_weight=imbalance_max_weight,
-            )
             class_names = [str(label) for label in sorted(unique_labels)]
             print(
                 "Train class weights: "
-                + format_class_weight_summary(counts_np, weights_np, class_labels=class_names)
+                + format_class_weight_summary(counts, class_weights.detach().cpu().numpy(), class_labels=class_names)
             )
 
         train_loader = _build_loader(
@@ -483,8 +474,7 @@ def run_trait_score_training(args):
             labels,
             train_idx,
             args,
-            shuffle=train_sampler is None,
-            sampler=train_sampler,
+            shuffle=True,
         )
         val_loader = _build_loader(trait_embeddings, labels, val_idx, args, shuffle=False)
         test_loader = _build_loader(trait_embeddings, labels, test_idx, args, shuffle=False)

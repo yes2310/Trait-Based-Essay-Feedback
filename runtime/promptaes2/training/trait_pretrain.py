@@ -8,7 +8,7 @@ import pandas as pd
 import torch
 from sklearn.model_selection import train_test_split
 from torch.optim.lr_scheduler import CosineAnnealingWarmRestarts
-from torch.utils.data import DataLoader, RandomSampler, SequentialSampler, WeightedRandomSampler
+from torch.utils.data import DataLoader, RandomSampler, SequentialSampler
 from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
 from transformers import AutoTokenizer, RobertaConfig, RobertaForSequenceClassification
@@ -17,7 +17,6 @@ from promptaes2.config import ConfigError, get_dataset_preset, validate_required
 from promptaes2.utils.checkpoint import EarlyStopping, build_checkpoint_name
 from promptaes2.utils.imbalance import (
     build_class_weight_tensor,
-    build_weighted_sampler,
     format_class_weight_summary,
 )
 from promptaes2.utils.metrics import calculate_accuracy_qwk
@@ -50,7 +49,6 @@ def _convert_dataframe_to_tensors(
     label_name: str,
     label_to_index: dict[object, int],
     *,
-    sampler: WeightedRandomSampler | None = None,
     shuffle: bool = False,
 ) -> DataLoader:
     inputs = tokenizer(
@@ -66,9 +64,7 @@ def _convert_dataframe_to_tensors(
     labels = torch.tensor(labels_normalized).long()
 
     dataset = torch.utils.data.TensorDataset(inputs.input_ids, inputs.attention_mask, labels)
-    if sampler is not None:
-        data_sampler = sampler
-    elif shuffle:
+    if shuffle:
         data_sampler = RandomSampler(dataset)
     else:
         data_sampler = SequentialSampler(dataset)
@@ -408,7 +404,6 @@ def _train_traits_on_partition(
         _print_split_distributions(trait_name, train_data, val_data, test_data)
 
         criterion = torch.nn.CrossEntropyLoss().to(device)
-        train_sampler: WeightedRandomSampler | None = None
         if imbalance_mitigation:
             train_labels = np.array([label_to_index[label] for label in train_data[trait_name].tolist()], dtype=np.int64)
             class_weights, counts = build_class_weight_tensor(
@@ -418,11 +413,6 @@ def _train_traits_on_partition(
                 device=device,
             )
             criterion = torch.nn.CrossEntropyLoss(weight=class_weights).to(device)
-            train_sampler, weights_np, counts_np = build_weighted_sampler(
-                train_labels,
-                num_classes=unique_label_count,
-                max_weight=imbalance_max_weight,
-            )
             class_names = [str(label) for label in unique_labels]
             print(
                 "Imbalance mitigation: enabled "
@@ -430,7 +420,7 @@ def _train_traits_on_partition(
             )
             print(
                 "Train class weights: "
-                + format_class_weight_summary(counts_np, weights_np, class_labels=class_names)
+                + format_class_weight_summary(counts, class_weights.detach().cpu().numpy(), class_labels=class_names)
             )
 
         try:
@@ -463,8 +453,7 @@ def _train_traits_on_partition(
             args.cpu_workers,
             trait_name,
             label_to_index,
-            sampler=train_sampler,
-            shuffle=train_sampler is None,
+            shuffle=True,
         )
         val_loader = _convert_dataframe_to_tensors(
             val_data,
