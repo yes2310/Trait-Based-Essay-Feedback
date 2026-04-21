@@ -5,7 +5,7 @@ import os
 import torch
 import torch.nn as nn
 
-from promptaes2.models.blocks import BaseNetwork, GroupMoE, RelationProcessor
+from promptaes2.models.blocks import BaseNetwork, GroupInteractionEncoder, GroupMoE
 from promptaes2.types import TraitGroup
 
 
@@ -77,15 +77,14 @@ class CreativityScorer(nn.Module):
             nn.init.zeros_(layer.bias)
 
         if self.evolution_stage in {"cross_attention", "full"}:
-            self.cross_attention = nn.ModuleList(
-                [
-                    RelationProcessor(embedding_dim, embedding_dim, use_skip2)
-                    for _ in range(len(trait_groups))
-                ]
+            self.group_interaction = GroupInteractionEncoder(
+                embedding_dim=embedding_dim,
+                num_groups=len(trait_groups),
+                use_post_skip=use_skip2,
             )
             self.gate = nn.Linear(embedding_dim * len(trait_groups), len(trait_groups))
         else:
-            self.cross_attention = None
+            self.group_interaction = None
             self.gate = None
 
         self.experts = nn.ModuleList(
@@ -197,7 +196,7 @@ class CreativityScorer(nn.Module):
         self,
         group_outputs: list[torch.Tensor],
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        assert self.cross_attention is not None
+        assert self.group_interaction is not None
         assert self.gate is not None
 
         relation_inputs = group_outputs
@@ -207,15 +206,14 @@ class CreativityScorer(nn.Module):
                 for group_idx, output in enumerate(group_outputs)
             ]
 
+        relation_tokens = torch.stack(relation_inputs, dim=1)
+        contextualized_groups = self.group_interaction(relation_tokens)
         relation_outputs = [
-            self.cross_attention[group_idx](
-                relation_inputs[group_idx],
-                relation_inputs[(group_idx + 1) % len(relation_inputs)],
-            )
-            for group_idx in range(len(relation_inputs))
+            contextualized_groups[:, group_idx, :]
+            for group_idx in range(contextualized_groups.size(1))
         ]
 
-        combined = torch.cat(relation_outputs, dim=1)
+        combined = contextualized_groups.reshape(contextualized_groups.size(0), -1)
         gate_logits = self.gate(combined)
         num_experts = len(self.experts)
         top_k = min(2, num_experts)
@@ -245,7 +243,7 @@ class CreativityScorer(nn.Module):
             topk_indices=topk_indices,
             top_k=top_k,
         )
-        pooled_embedding = torch.stack(relation_outputs, dim=1).mean(dim=1)
+        pooled_embedding = contextualized_groups.mean(dim=1)
         return logits, aux_loss, pooled_embedding
 
     def forward(

@@ -30,6 +30,11 @@ class BaseNetwork(nn.Module):
         self.hidden_dropouts = nn.ModuleList(
             [nn.Dropout(self.dropout_rates[1]) for _ in range(len(hidden_sizes) - 1)]
         )
+        self.skip_projection = (
+            nn.Identity()
+            if hidden_sizes[0] == hidden_sizes[-1]
+            else nn.Linear(hidden_sizes[0], hidden_sizes[-1])
+        )
 
         self.output_layer = nn.Linear(hidden_sizes[-1], output_size)
 
@@ -43,7 +48,7 @@ class BaseNetwork(nn.Module):
             x = dropout(x)
 
         if self.use_skip:
-            x = x + identity
+            x = x + self.skip_projection(identity)
 
         return self.output_layer(x)
 
@@ -156,3 +161,75 @@ class RelationProcessor(nn.Module):
         if self.use_skip:
             attn_output = attn_output + cls1 + cls2
         return self.relation_projection(attn_output)
+
+
+class GroupInteractionEncoder(nn.Module):
+    def __init__(
+        self,
+        embedding_dim: int,
+        num_groups: int,
+        *,
+        num_heads: int = 4,
+        dropout: float = 0.1,
+        ff_multiplier: int = 2,
+        use_post_skip: bool = False,
+    ) -> None:
+        super().__init__()
+        if num_groups < 1:
+            raise ValueError("num_groups must be >= 1")
+        if num_heads < 1:
+            raise ValueError("num_heads must be >= 1")
+
+        effective_num_heads = min(num_heads, embedding_dim)
+        while effective_num_heads > 1 and (embedding_dim % effective_num_heads) != 0:
+            effective_num_heads -= 1
+
+        self.num_groups = num_groups
+        self.num_heads = effective_num_heads
+        self.use_post_skip = use_post_skip
+        self.group_type_embeddings = nn.Parameter(torch.zeros(1, num_groups, embedding_dim))
+        self.attention = nn.MultiheadAttention(
+            embed_dim=embedding_dim,
+            num_heads=effective_num_heads,
+            dropout=dropout,
+            batch_first=True,
+        )
+        self.attention_norm = nn.LayerNorm(embedding_dim)
+        hidden_dim = embedding_dim * ff_multiplier
+        self.ffn = nn.Sequential(
+            nn.Linear(embedding_dim, hidden_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, embedding_dim),
+            nn.Dropout(dropout),
+        )
+        self.ffn_norm = nn.LayerNorm(embedding_dim)
+        self.attention_weights: torch.Tensor | None = None
+
+    def forward(self, group_tokens: torch.Tensor) -> torch.Tensor:
+        if group_tokens.ndim != 3:
+            raise ValueError(
+                f"group_tokens must have shape [batch, groups, embedding_dim], got {group_tokens.shape}"
+            )
+        if group_tokens.size(1) != self.num_groups:
+            raise ValueError(
+                f"Expected {self.num_groups} group tokens, got {group_tokens.size(1)}"
+            )
+
+        residual_input = group_tokens
+        x = group_tokens + self.group_type_embeddings[:, : group_tokens.size(1), :]
+        attn_output, attention_weights = self.attention(
+            x,
+            x,
+            x,
+            need_weights=True,
+            average_attn_weights=False,
+        )
+        self.attention_weights = attention_weights.mean(dim=1)
+        x = self.attention_norm(x + attn_output)
+
+        ffn_output = self.ffn(x)
+        x = self.ffn_norm(x + ffn_output)
+        if self.use_post_skip:
+            x = x + residual_input
+        return x

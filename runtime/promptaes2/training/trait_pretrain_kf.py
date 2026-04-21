@@ -283,7 +283,11 @@ def run_trait_pretrain(args):
 
         try:
             model_config = RobertaConfig.from_pretrained(model_name, num_labels=unique_label_count)
-            model = RobertaForSequenceClassification.from_pretrained(model_name, config=model_config)
+            model = RobertaForSequenceClassification.from_pretrained(
+                model_name,
+                config=model_config,
+                ignore_mismatched_sizes=True,
+            )
         except Exception as exc:  # noqa: BLE001
             raise RuntimeError(
                 f"Failed to load model '{model_name}'. "

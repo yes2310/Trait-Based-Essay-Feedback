@@ -35,6 +35,12 @@ def _add_holistic_parser(subparsers):
     parser.add_argument("--embedding_dim", type=int, default=768)
     parser.add_argument("--batch_size", type=int, default=256)
     parser.add_argument("--learning_rate", type=float, default=6e-5)
+    parser.add_argument(
+        "--class_balance_mode",
+        type=str,
+        choices=["none", "loss", "loss_and_sampler"],
+        default="none",
+    )
     parser.add_argument("--hidden_sizes", type=str, default="512-512")
     parser.add_argument("--dropout", type=str, default="0.1-0.1")
 
@@ -131,6 +137,12 @@ def _add_trait_score_parser(subparsers):
     parser.add_argument("--embedding_dim", type=int, default=768)
     parser.add_argument("--batch_size", type=int, default=256)
     parser.add_argument("--learning_rate", type=float, default=6e-5)
+    parser.add_argument(
+        "--class_balance_mode",
+        type=str,
+        choices=["none", "loss", "loss_and_sampler"],
+        default="none",
+    )
     parser.add_argument("--hidden_sizes", type=str, default="512-512")
     parser.add_argument("--dropout", type=str, default="0.1-0.1")
     parser.add_argument("--moe_aux_weight", type=float, default=0.01)

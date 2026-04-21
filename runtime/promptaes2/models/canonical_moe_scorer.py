@@ -5,7 +5,7 @@ import os
 import torch
 import torch.nn as nn
 
-from promptaes2.models.blocks import BaseNetwork, RelationProcessor
+from promptaes2.models.blocks import BaseNetwork, GroupInteractionEncoder
 from promptaes2.types import TraitGroup
 
 
@@ -179,11 +179,10 @@ class CanonicalMoECreativityScorer(nn.Module):
             nn.init.zeros_(layer.bias)
 
         if self.evolution_stage in {"cross_attention", "full"}:
-            self.cross_attention = nn.ModuleList(
-                [
-                    RelationProcessor(embedding_dim, embedding_dim, use_skip2)
-                    for _ in range(len(trait_groups))
-                ]
+            self.group_interaction = GroupInteractionEncoder(
+                embedding_dim=embedding_dim,
+                num_groups=len(trait_groups),
+                use_post_skip=use_skip2,
             )
             self.relation_classifier = TopKExpertRouter(
                 input_size=embedding_dim,
@@ -196,7 +195,7 @@ class CanonicalMoECreativityScorer(nn.Module):
                 gate_input_size=embedding_dim * len(trait_groups),
             )
         else:
-            self.cross_attention = None
+            self.group_interaction = None
             self.relation_classifier = None
 
         self.baseline_classifier = TopKExpertRouter(
@@ -303,7 +302,7 @@ class CanonicalMoECreativityScorer(nn.Module):
         self,
         group_outputs: list[torch.Tensor],
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        assert self.cross_attention is not None
+        assert self.group_interaction is not None
         assert self.relation_classifier is not None
 
         relation_inputs = group_outputs
@@ -313,16 +312,11 @@ class CanonicalMoECreativityScorer(nn.Module):
                 for group_idx, output in enumerate(group_outputs)
             ]
 
-        relation_outputs = [
-            self.cross_attention[group_idx](
-                relation_inputs[group_idx],
-                relation_inputs[(group_idx + 1) % len(relation_inputs)],
-            )
-            for group_idx in range(len(relation_inputs))
-        ]
+        relation_tokens = torch.stack(relation_inputs, dim=1)
+        contextualized_groups = self.group_interaction(relation_tokens)
 
-        pooled_embedding = torch.stack(relation_outputs, dim=1).mean(dim=1)
-        gate_input = torch.cat(relation_outputs, dim=1)
+        pooled_embedding = contextualized_groups.mean(dim=1)
+        gate_input = contextualized_groups.reshape(contextualized_groups.size(0), -1)
         logits = self.relation_classifier(pooled_embedding, gate_input=gate_input)
         self.group_weights = self.relation_classifier.expert_weights
         aux_loss = self.relation_classifier.aux_loss

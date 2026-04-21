@@ -1,0 +1,72 @@
+{
+  "Grammar accuracy": {
+    "5": "Command of grammar and usage with few or no errors",
+    "4": "Minimum errors in grammar and usage",
+    "3": "Some errors in grammar and usage",
+    "2": "Many errors in grammar and usage",
+    "1": "Errors in grammar and usage throughout"
+  },
+  "Appropriateness of word use": {
+    "5": "Uses the most appropriate words for the context",
+    "4": "Mostly appropriate word choices, with rare instances of slightly awkward phrasing",
+    "3": "Some word choices feel out of place, vague, very complex or simple for the context",
+    "2": "Several words are misused or inappropriate for the intended meaning",
+    "1": "Many words incorrectly used, leading to serious misunderstanding"
+  },
+  "Elasticity of sentence expression": {
+    "5": "Sentences flow smoothly with varied structures",
+    "4": "Generally fluid and adaptable, but occasional repetition in structure",
+    "3": "Some flexibility but noticeable repetition in sentence structure",
+    "2": "Sentences feel rigid or overly structured",
+    "1": "Extremely repetitive, awkward, or mechanically structured sentences"
+    },
+  "Appropriateness of structure within a paragraph":
+    "5": "Sentences flow smoothly with a clear and logical progression of ideas",
+    "4": "Sentences are generally well-organized with only slight inconsistencies in flow",
+    "3": "Paragraph structure is somewhat logical but may feel disjointed in parts",
+    "2": "Sentences are placed in an order that disrupts readability for logical progression",
+    "1": "Sentences appear randomly placed with no clear logical order"
+  },
+  "Adequacy of inter-paragraph structure": {
+    "5": "Each paragraph is clearly linked to the previous and subsequent ones, contributing to a smooth and logical flow",
+    "4": "The paragraphs are generally well-structured with a clear connection between them",
+    "3": "Paragraphs are related, but the connections between them can feel weak",
+    "2": "The relation between paragraphs is unclear, with incomplete transitions",
+    "1": "The paragraphs feel disjoint or randomly ordered with no logical progression"
+  },
+ "Consistency of structure": {
+   "5": "The essay maintains a consistent structure throughout",
+   "4": "Overall, the structure is consistent, but there may be a few minor instances of sentence or paragraph length variations or slight shifts in tone",
+   "3": "Some variations in structure are noticeable, but they do not majorly affect comprehension",
+   "2": "Significant variations in sentence length, structure, or formatting that detracts from the clarity and flow of the text",
+   "1": "Flequent changes in formatting, tone or sentence structure disrupt the reader's exprience"
+ },
+ "Appropriateness of portion size": {
+   "5": "Each paragraph and section is appropriately sized, neither too long nor too short",
+   "4": "The portion size is generally well-maintained, but there may be a few slightly long or short sections",
+   "3": "Some paragraphs or sections feel either overly brief or overly detailed, which can slightly hinder comprehension flow",
+   "2": "The text has noticeable inconsistencies in portion sizes, where some sections are too long and other too brief",
+   "1": "Portions are severly unbalanced, with overly long sections that are hard to digest and very short sections that lack necessary information"
+ },
+ "Clarity of topic": {
+   "5": "The main topic is immediately clear, well-defined, and consistently addressed throughtout the text",
+   "4": "The topic is generally clear, though there may be minor ambiguities or moments where the focus drifts slightly",
+   "3": "The topic is somewhat clear, but some sections may feel vague or lack clear focus",
+   "2": "The topic is difficult to identify, either because it is underdeveloped or not clearly stated",
+   "1": "The topic is completely unclear, making it difficult for the reader to understand the purpose of the text"
+},
+ "Specificity of explanation": {
+   "5": "The explanation is clear, focused, and provides all the relevant details to fully understand the topic",
+   "4": "The explanation is generally clear and detailed, though there may be occasional generalizations or lack of examples",
+   "3": "The explanation is somewhat clear but lacks sufficient detail in certain areas",
+   "2": "The explanation is to vague or incomplete, lacking sufficient detail or examples",
+   "1": "The explanation is general, completely lacks detail"
+ },
+  "Ceativity of thought": {
+   "5": "The essay is original, imaginative, and thought provoking",
+   "4": "The essay contains novel insights or unique approaches, but with a slight reliance on common approaches",
+   "3": "The essay contains some cretive ideas, but many of them are not highly original",
+   "2": "The ideas presented are mostly conventional and lack originality",
+   "1": "The essay lacks any creative or original thinking, offering ideas that are entirely common or uninspired"
+  }
+}

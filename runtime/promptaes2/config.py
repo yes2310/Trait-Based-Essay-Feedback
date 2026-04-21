@@ -54,10 +54,16 @@ DATASET_PRESETS: dict[str, DatasetPreset] = {
     "leaf": DatasetPreset(
         dataset="leaf",
         default_traits=[
-            "alignment_with_topic",
-            "spelling_grammar_style",
-            "clarity_of_view_point",
-            "arguments_supporting_details",
+            "grammar_accuracy",
+            "appropriateness_of_word_use",
+            "elasticity_of_sentence_expression",
+            "appropriateness_of_structure_within_a_paragraph",
+            "adequacy_of_inter_paragraph_structure",
+            "consistency_of_structure",
+            "appropriateness_of_portion_size",
+            "clarity_of_topic",
+            "specificity_of_explanation",
+            "creativity_of_thought",
         ],
         default_model_name="roberta-base",
         default_data_path="data/leaf_merged.csv",
@@ -110,7 +116,7 @@ def parse_trait_groups(value: str) -> TraitGroup:
     for group in raw_groups:
         if ":" not in group:
             raise ConfigError(
-                f"Invalid trait group '{group}'. Expected format 'trait1,trait2:2'."
+                f"Invalid trait group '{group}'. Expected format 'trait1,trait2:2' or 'trait1,trait2,trait3:3'."
             )
 
         traits_raw, dim_raw = group.split(":", 1)

@@ -6,15 +6,17 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 import torch
+import torch.nn as nn
 from sklearn.model_selection import train_test_split
 from torch.optim.lr_scheduler import CosineAnnealingWarmRestarts
-from torch.utils.data import DataLoader, RandomSampler
+from torch.utils.data import DataLoader, WeightedRandomSampler
 from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
 from transformers import AutoTokenizer, RobertaConfig, RobertaForSequenceClassification
 
 from promptaes2.config import ConfigError, get_dataset_preset, validate_required_columns
 from promptaes2.utils.checkpoint import EarlyStopping, build_checkpoint_name
+from promptaes2.utils.class_balance import maybe_build_class_weight_tensor, maybe_build_weighted_sampler
 from promptaes2.utils.metrics import calculate_accuracy_qwk
 
 
@@ -43,6 +45,10 @@ def _convert_dataframe_to_tensors(
     batch_size: int,
     cpu_workers: int,
     label_name: str,
+    label_mapping: dict[float | int, int],
+    *,
+    shuffle: bool = False,
+    sampler: WeightedRandomSampler | None = None,
 ) -> DataLoader:
     inputs = tokenizer(
         data["text"].tolist(),
@@ -53,16 +59,21 @@ def _convert_dataframe_to_tensors(
     )
 
     labels_raw = data[label_name].tolist()
-    min_label = min(labels_raw)
-    labels_normalized = [int(label - min_label) for label in labels_raw]
+    labels_normalized = [label_mapping[label] for label in labels_raw]
     labels = torch.tensor(labels_normalized).long()
 
     dataset = torch.utils.data.TensorDataset(inputs.input_ids, inputs.attention_mask, labels)
+    loader_kwargs = dict(
+        batch_size=batch_size,
+        num_workers=cpu_workers,
+    )
+    if sampler is not None:
+        loader_kwargs["sampler"] = sampler
+    else:
+        loader_kwargs["shuffle"] = shuffle
     return DataLoader(
         dataset,
-        batch_size=batch_size,
-        sampler=RandomSampler(dataset),
-        num_workers=cpu_workers,
+        **loader_kwargs,
     )
 
 
@@ -163,7 +174,7 @@ def _split_by_predefined_column(
     return split_frames["train"], split_frames["val"], split_frames["test"]
 
 
-def _train_epoch(model, dataloader: DataLoader, optimizer, device: torch.device) -> tuple[float, float, float]:
+def _train_epoch(model, dataloader: DataLoader, optimizer, criterion, device: torch.device) -> tuple[float, float, float]:
     model.train()
     total_loss = 0.0
     all_labels: list[int] = []
@@ -173,8 +184,8 @@ def _train_epoch(model, dataloader: DataLoader, optimizer, device: torch.device)
         inputs, masks, labels = [item.to(device) for item in batch]
 
         optimizer.zero_grad()
-        outputs = model(input_ids=inputs, attention_mask=masks, labels=labels)
-        loss = outputs.loss
+        outputs = model(input_ids=inputs, attention_mask=masks, return_dict=True)
+        loss = criterion(outputs.logits, labels)
         loss.backward()
         optimizer.step()
 
@@ -189,7 +200,7 @@ def _train_epoch(model, dataloader: DataLoader, optimizer, device: torch.device)
     return total_loss / len(dataloader), accuracy, qwk
 
 
-def _validate_epoch(model, dataloader: DataLoader, device: torch.device) -> tuple[float, float, float]:
+def _validate_epoch(model, dataloader: DataLoader, criterion, device: torch.device) -> tuple[float, float, float]:
     model.eval()
     total_loss = 0.0
     all_labels: list[int] = []
@@ -198,8 +209,9 @@ def _validate_epoch(model, dataloader: DataLoader, device: torch.device) -> tupl
     with torch.no_grad():
         for batch in dataloader:
             inputs, masks, labels = [item.to(device) for item in batch]
-            outputs = model(input_ids=inputs, attention_mask=masks, labels=labels)
-            total_loss += float(outputs.loss.item())
+            outputs = model(input_ids=inputs, attention_mask=masks, return_dict=True)
+            loss = criterion(outputs.logits, labels)
+            total_loss += float(loss.item())
 
             predictions = torch.argmax(outputs.logits, dim=1).cpu().numpy().tolist()
             labels_np = labels.cpu().numpy().tolist()
@@ -256,6 +268,7 @@ def _maybe_init_wandb(
             "epochs": int(getattr(args, "epochs", 20)),
             "auto_stop": bool(getattr(args, "auto_stop", False)),
             "early_stopping_patience": int(getattr(args, "early_stopping_patience", 5)),
+            "class_balance_mode": str(getattr(args, "class_balance_mode", "none")),
         },
     )
     return run
@@ -338,6 +351,7 @@ def _train_traits_on_partition(
     scheduler_eta_min = float(getattr(args, "scheduler_eta_min", 1e-6))
     print_epoch_metrics = bool(getattr(args, "print_epoch_metrics", False))
     predefined_split_column = getattr(args, "predefined_split_column", None)
+    class_balance_mode = str(getattr(args, "class_balance_mode", "none"))
 
     final_results: dict[str, dict[str, float | int]] = {}
     for trait_name in traits:
@@ -355,6 +369,7 @@ def _train_traits_on_partition(
         if unique_label_count < 2:
             print(f"Skipping '{trait_name}': requires at least 2 unique labels.")
             continue
+        label_mapping = {old: new for new, old in enumerate(unique_labels)}
 
         try:
             if predefined_split_column is not None:
@@ -389,7 +404,11 @@ def _train_traits_on_partition(
 
         try:
             model_config = RobertaConfig.from_pretrained(model_name, num_labels=unique_label_count)
-            model = RobertaForSequenceClassification.from_pretrained(model_name, config=model_config)
+            model = RobertaForSequenceClassification.from_pretrained(
+                model_name,
+                config=model_config,
+                ignore_mismatched_sizes=True,
+            )
         except Exception as exc:  # noqa: BLE001
             raise RuntimeError(
                 f"Failed to load model '{model_name}'. "
@@ -409,6 +428,21 @@ def _train_traits_on_partition(
             else None
         )
 
+        train_labels = np.array([label_mapping[label] for label in train_data[trait_name].tolist()], dtype=np.int64)
+        class_weights = maybe_build_class_weight_tensor(
+            train_labels,
+            class_balance_mode=class_balance_mode,
+            num_classes=unique_label_count,
+        )
+        criterion_weight = class_weights.to(device) if class_weights is not None else None
+        criterion = nn.CrossEntropyLoss(weight=criterion_weight).to(device)
+        train_sampler = maybe_build_weighted_sampler(
+            train_labels,
+            class_balance_mode=class_balance_mode,
+            num_classes=unique_label_count,
+            seed=args.seed,
+        )
+
         train_loader = _convert_dataframe_to_tensors(
             train_data,
             tokenizer,
@@ -416,6 +450,9 @@ def _train_traits_on_partition(
             args.batch_size,
             args.cpu_workers,
             trait_name,
+            label_mapping,
+            shuffle=train_sampler is None,
+            sampler=train_sampler,
         )
         val_loader = _convert_dataframe_to_tensors(
             val_data,
@@ -424,6 +461,7 @@ def _train_traits_on_partition(
             args.batch_size,
             args.cpu_workers,
             trait_name,
+            label_mapping,
         )
         test_loader = _convert_dataframe_to_tensors(
             test_data,
@@ -432,6 +470,7 @@ def _train_traits_on_partition(
             args.batch_size,
             args.cpu_workers,
             trait_name,
+            label_mapping,
         )
 
         checkpoint_name = build_checkpoint_name(args.dataset, "trait", trait_name)
@@ -466,8 +505,8 @@ def _train_traits_on_partition(
         print(f"\nTraining trait: {trait_name} ({unique_label_count} classes)")
         try:
             for epoch in range(epochs):
-                train_loss, train_acc, train_qwk = _train_epoch(model, train_loader, optimizer, device)
-                val_loss, val_acc, val_qwk = _validate_epoch(model, val_loader, device)
+                train_loss, train_acc, train_qwk = _train_epoch(model, train_loader, optimizer, criterion, device)
+                val_loss, val_acc, val_qwk = _validate_epoch(model, val_loader, criterion, device)
                 if scheduler is not None:
                     scheduler.step(epoch + 1)
                 current_lr = optimizer.param_groups[0]["lr"]
@@ -516,7 +555,7 @@ def _train_traits_on_partition(
                 )
 
             model.load_state_dict(torch.load(checkpoint_path, map_location=device))
-            test_loss, test_acc, test_qwk = _validate_epoch(model, test_loader, device)
+            test_loss, test_acc, test_qwk = _validate_epoch(model, test_loader, criterion, device)
 
             model_name_out = build_checkpoint_name(args.dataset, "trait_model", trait_name)
             model_output_path = output_dir / model_name_out
@@ -609,6 +648,7 @@ def run_trait_pretrain(args):
     print(f"Model name: {model_name}")
     print(f"Epochs: {epochs}")
     print(f"Scheduler: {scheduler_type}")
+    print(f"Class balance mode: {getattr(args, 'class_balance_mode', 'none')}")
     print(f"Auto stop: {auto_stop} (patience={early_stopping_patience})")
     print(f"Print epoch metrics: {print_epoch_metrics}")
     print(f"W&B logging: {use_wandb}")

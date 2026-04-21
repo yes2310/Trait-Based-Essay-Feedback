@@ -9,7 +9,7 @@ import torch
 import torch.nn as nn
 from sklearn.model_selection import train_test_split
 from torch.optim.lr_scheduler import CosineAnnealingWarmRestarts
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import DataLoader, Dataset, WeightedRandomSampler
 from tqdm.auto import tqdm
 
 from promptaes2.config import ConfigError, get_dataset_preset, validate_required_columns
@@ -18,6 +18,7 @@ from promptaes2.data.datasets import MultiEmbeddingDataset
 from promptaes2.losses.combined import CombinedLoss
 from promptaes2.models.factory import build_scoring_model
 from promptaes2.utils.checkpoint import EarlyStopping, build_checkpoint_name
+from promptaes2.utils.class_balance import maybe_build_class_weight_tensor, maybe_build_weighted_sampler
 from promptaes2.utils.metrics import calculate_accuracy_qwk
 
 
@@ -315,6 +316,55 @@ def _format_label_distribution(labels: np.ndarray) -> str:
     return ", ".join(parts)
 
 
+def _build_data_loader(
+    dataset,
+    *,
+    batch_size: int,
+    cpu_workers: int,
+    shuffle: bool,
+    sampler: WeightedRandomSampler | None = None,
+) -> DataLoader:
+    loader_kwargs = {
+        "batch_size": batch_size,
+        "drop_last": False,
+        "num_workers": cpu_workers,
+    }
+    if sampler is not None:
+        loader_kwargs["sampler"] = sampler
+    else:
+        loader_kwargs["shuffle"] = shuffle
+    return DataLoader(dataset, **loader_kwargs)
+
+
+def _build_class_balance_artifacts(
+    labels: np.ndarray,
+    args,
+    *,
+    num_classes: int,
+) -> tuple[torch.Tensor | None, WeightedRandomSampler | None]:
+    class_balance_mode = str(getattr(args, "class_balance_mode", "none"))
+    class_weights = maybe_build_class_weight_tensor(
+        labels,
+        class_balance_mode=class_balance_mode,
+        num_classes=num_classes,
+    )
+    sampler = maybe_build_weighted_sampler(
+        labels,
+        class_balance_mode=class_balance_mode,
+        num_classes=num_classes,
+        seed=args.seed,
+    )
+    return class_weights, sampler
+
+
+def _build_cross_entropy_criterion(
+    device: torch.device,
+    class_weights: torch.Tensor | None,
+) -> nn.CrossEntropyLoss:
+    criterion_weight = class_weights.to(device) if class_weights is not None else None
+    return nn.CrossEntropyLoss(weight=criterion_weight).to(device)
+
+
 def _print_split_distributions(
     train_labels: np.ndarray,
     val_labels: np.ndarray,
@@ -426,6 +476,7 @@ def _maybe_init_wandb(args, run_name_override: str | None = None):
             "group_num_experts": int(getattr(args, "group_num_experts", 8)),
             "classifier_num_experts": int(getattr(args, "classifier_num_experts", 8)),
             "router_top_k": int(getattr(args, "router_top_k", 2)),
+            "class_balance_mode": str(getattr(args, "class_balance_mode", "none")),
         },
     )
     return run
@@ -498,6 +549,10 @@ def _print_holistic_startup_info(args) -> None:
         "Pre-skip toggles: "
         f"pre_homo={bool(getattr(args, 'use_pre_homo_skip', False))}, "
         f"pre_hetero={bool(getattr(args, 'use_pre_hetero_skip', False))}",
+        flush=True,
+    )
+    print(
+        f"Class balance mode: {str(getattr(args, 'class_balance_mode', 'none'))}",
         flush=True,
     )
     model_variant = str(getattr(args, "model_variant", "legacy"))
@@ -711,26 +766,35 @@ def _run_single_holistic_training(
         contrastive_scores=contrastive_scores[test_idx] if args.loss_type == "combined" else None,
     )
 
-    train_loader = DataLoader(
+    class_weights, train_sampler = _build_class_balance_artifacts(
+        labels[train_idx],
+        args,
+        num_classes=unique_labels_count,
+    )
+    train_loader = _build_data_loader(
         train_dataset,
         batch_size=args.batch_size,
-        shuffle=True,
-        drop_last=False,
-        num_workers=args.cpu_workers,
+        cpu_workers=args.cpu_workers,
+        shuffle=train_sampler is None,
+        sampler=train_sampler,
     )
-    val_loader = DataLoader(
+    train_reference_loader = _build_data_loader(
+        train_dataset,
+        batch_size=args.batch_size,
+        cpu_workers=args.cpu_workers,
+        shuffle=False,
+    )
+    val_loader = _build_data_loader(
         val_dataset,
         batch_size=args.batch_size,
+        cpu_workers=args.cpu_workers,
         shuffle=False,
-        drop_last=False,
-        num_workers=args.cpu_workers,
     )
-    test_loader = DataLoader(
+    test_loader = _build_data_loader(
         test_dataset,
         batch_size=args.batch_size,
+        cpu_workers=args.cpu_workers,
         shuffle=False,
-        drop_last=False,
-        num_workers=args.cpu_workers,
     )
 
     if len(train_loader) == 0:
@@ -784,11 +848,12 @@ def _run_single_holistic_training(
             beta3=args.beta3,
             beta4=args.beta4,
             margin=args.margin,
+            ce_weight=class_weights,
         ).to(device)
         if args.loss_type == "combined"
-        else nn.CrossEntropyLoss().to(device)
+        else _build_cross_entropy_criterion(device, class_weights)
     )
-    ce_only_criterion = nn.CrossEntropyLoss().to(device)
+    ce_only_criterion = _build_cross_entropy_criterion(device, class_weights)
 
     def _unpack_holistic_batch(batch):
         if args.loss_type == "combined":
@@ -858,7 +923,7 @@ def _run_single_holistic_training(
         init_embeddings: list[torch.Tensor] = []
         init_scores: list[torch.Tensor] = []
         with torch.no_grad():
-            for batch in train_loader:
+            for batch in train_reference_loader:
                 batch_embeddings, _, contrastive_scores_batch = _unpack_holistic_batch(batch)
                 if contrastive_scores_batch is None:
                     raise RuntimeError("Combined loss requires contrastive scores in the dataloader.")
@@ -1220,26 +1285,35 @@ def _run_single_holistic_training_e2e(
         contrastive_scores=contrastive_scores[test_idx] if args.loss_type == "combined" else None,
     )
 
-    train_loader = DataLoader(
+    class_weights, train_sampler = _build_class_balance_artifacts(
+        labels[train_idx],
+        args,
+        num_classes=unique_labels_count,
+    )
+    train_loader = _build_data_loader(
         train_dataset,
         batch_size=args.batch_size,
-        shuffle=True,
-        drop_last=False,
-        num_workers=args.cpu_workers,
+        cpu_workers=args.cpu_workers,
+        shuffle=train_sampler is None,
+        sampler=train_sampler,
     )
-    val_loader = DataLoader(
+    train_reference_loader = _build_data_loader(
+        train_dataset,
+        batch_size=args.batch_size,
+        cpu_workers=args.cpu_workers,
+        shuffle=False,
+    )
+    val_loader = _build_data_loader(
         val_dataset,
         batch_size=args.batch_size,
+        cpu_workers=args.cpu_workers,
         shuffle=False,
-        drop_last=False,
-        num_workers=args.cpu_workers,
     )
-    test_loader = DataLoader(
+    test_loader = _build_data_loader(
         test_dataset,
         batch_size=args.batch_size,
+        cpu_workers=args.cpu_workers,
         shuffle=False,
-        drop_last=False,
-        num_workers=args.cpu_workers,
     )
 
     if len(train_loader) == 0:
@@ -1308,11 +1382,12 @@ def _run_single_holistic_training_e2e(
             beta3=args.beta3,
             beta4=args.beta4,
             margin=args.margin,
+            ce_weight=class_weights,
         ).to(device)
         if args.loss_type == "combined"
-        else nn.CrossEntropyLoss().to(device)
+        else _build_cross_entropy_criterion(device, class_weights)
     )
-    ce_only_criterion = nn.CrossEntropyLoss().to(device)
+    ce_only_criterion = _build_cross_entropy_criterion(device, class_weights)
 
     unfreeze_epoch = int(getattr(args, "unfreeze_epoch", 0))
     backbones_unfrozen = unfreeze_epoch == 0
@@ -1423,7 +1498,7 @@ def _run_single_holistic_training_e2e(
         init_embeddings: list[torch.Tensor] = []
         init_scores: list[torch.Tensor] = []
         with torch.no_grad():
-            for batch in train_loader:
+            for batch in train_reference_loader:
                 text_batch, _, contrastive_scores_batch = _unpack_text_batch(batch)
                 if contrastive_scores_batch is None:
                     raise RuntimeError("Combined loss requires contrastive scores in the dataloader.")

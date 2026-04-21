@@ -8,8 +8,11 @@ run_workspace_python_module promptaes2.cli train-holistic \
   --trait_checkpoint_dir "$WORKSPACE_DIR/results/trait_pretrain" \
   --csv_path "$WORKSPACE_DIR/data/leaf_merged.csv" \
   --predefined_split_column split \
-  --trait_groups "alignment_with_topic,arguments_supporting_details:2;clarity_of_view_point,spelling_grammar_style:2" \
-  --ablation_mode homo_hetero \
+  --trait_groups "$LEAF_TRAIT_GROUPS" \
+  --class_balance_mode "$LEAF_CLASS_BALANCE_MODE" \
+  --model_variant "$LEAF_MODEL_VARIANT" \
+  --evolution_stage "$LEAF_EVOLUTION_STAGE" \
+  --warmup_epochs "$LEAF_WARMUP_EPOCHS" \
   --epochs 20 \
   --batch_size 32 \
   --output_dir "$WORKSPACE_DIR/results/holistic"

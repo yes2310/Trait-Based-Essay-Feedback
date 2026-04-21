@@ -5,6 +5,25 @@ WORKSPACE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 VENV_DIR="$WORKSPACE_DIR/.venv"
 VENV_PYTHON="$VENV_DIR/bin/python"
 
+LEAF_SEMANTIC_TRAITS=(
+  grammar_accuracy
+  appropriateness_of_word_use
+  elasticity_of_sentence_expression
+  appropriateness_of_structure_within_a_paragraph
+  adequacy_of_inter_paragraph_structure
+  consistency_of_structure
+  appropriateness_of_portion_size
+  clarity_of_topic
+  specificity_of_explanation
+  creativity_of_thought
+)
+
+LEAF_TRAIT_GROUPS="grammar_accuracy,appropriateness_of_word_use,elasticity_of_sentence_expression:3;appropriateness_of_structure_within_a_paragraph,adequacy_of_inter_paragraph_structure,consistency_of_structure,appropriateness_of_portion_size:4;clarity_of_topic,specificity_of_explanation,creativity_of_thought:3"
+LEAF_CLASS_BALANCE_MODE="loss_and_sampler"
+LEAF_MODEL_VARIANT="canonical_moe"
+LEAF_EVOLUTION_STAGE="full"
+LEAF_WARMUP_EPOCHS="3"
+
 ensure_uv() {
   if command -v uv >/dev/null 2>&1; then
     return 0

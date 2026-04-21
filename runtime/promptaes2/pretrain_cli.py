@@ -23,6 +23,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--batch_size", type=int, default=16)
     parser.add_argument("--learning_rate", type=float, default=5e-5)
     parser.add_argument("--max_seq_length", type=int, default=512)
+    parser.add_argument(
+        "--class_balance_mode",
+        type=str,
+        choices=["none", "loss", "loss_and_sampler"],
+        default="none",
+    )
     parser.add_argument("--epochs", type=int, default=None)
     parser.add_argument("--auto_stop", action="store_true", default=False)
     parser.add_argument("--cpu_workers", type=int, default=4)
@@ -64,6 +70,8 @@ def _validate_parsed_args(args, parser: argparse.ArgumentParser) -> None:
         parser.error("--epochs must be >= 1")
     if args.batch_size < 1:
         parser.error("--batch_size must be >= 1")
+    if args.max_seq_length < 1:
+        parser.error("--max_seq_length must be >= 1")
     if args.early_stopping_patience < 1:
         parser.error("--early_stopping_patience must be >= 1")
     if args.scheduler_t0 < 1:

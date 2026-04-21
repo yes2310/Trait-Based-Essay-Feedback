@@ -8,7 +8,7 @@ import torch
 import torch.nn as nn
 from sklearn.model_selection import train_test_split
 from torch.optim.lr_scheduler import CosineAnnealingWarmRestarts
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, WeightedRandomSampler
 from tqdm.auto import tqdm
 
 from promptaes2.config import ConfigError, validate_required_columns
@@ -17,6 +17,7 @@ from promptaes2.data.datasets import MultiEmbeddingDataset
 from promptaes2.models.factory import build_scoring_model
 from promptaes2.training.holistic import _extract_embeddings_from_trait_checkpoints
 from promptaes2.utils.checkpoint import EarlyStopping, build_checkpoint_name
+from promptaes2.utils.class_balance import maybe_build_class_weight_tensor, maybe_build_weighted_sampler
 from promptaes2.utils.metrics import calculate_accuracy_qwk
 
 
@@ -163,6 +164,7 @@ def _maybe_init_wandb(args, target_trait: str):
             "group_num_experts": int(getattr(args, "group_num_experts", 8)),
             "classifier_num_experts": int(getattr(args, "classifier_num_experts", 8)),
             "router_top_k": int(getattr(args, "router_top_k", 2)),
+            "class_balance_mode": str(getattr(args, "class_balance_mode", "none")),
         },
     )
     return run
@@ -187,16 +189,30 @@ def _resolve_embeddings_and_essay(args, required_embedding_traits: list[str], de
     return embeddings_dict, essay
 
 
-def _build_loader(embeddings_dict: dict[str, np.ndarray], labels: np.ndarray, indices: np.ndarray, args, shuffle: bool):
+def _build_loader(
+    embeddings_dict: dict[str, np.ndarray],
+    labels: np.ndarray,
+    indices: np.ndarray,
+    args,
+    *,
+    shuffle: bool,
+    sampler: WeightedRandomSampler | None = None,
+):
     subset_embeddings = {trait: emb[indices] for trait, emb in embeddings_dict.items()}
     subset_labels = labels[indices]
     dataset = MultiEmbeddingDataset(subset_embeddings, subset_labels)
-    return DataLoader(
-        dataset,
+    loader_kwargs = dict(
         batch_size=args.batch_size,
-        shuffle=shuffle,
         drop_last=False,
         num_workers=args.cpu_workers,
+    )
+    if sampler is not None:
+        loader_kwargs["sampler"] = sampler
+    else:
+        loader_kwargs["shuffle"] = shuffle
+    return DataLoader(
+        dataset,
+        **loader_kwargs,
     )
 
 
@@ -347,6 +363,7 @@ def run_trait_score_training(args):
     print(f"Mode: trait-score")
     print(f"Target traits: {args.target_traits}")
     print(f"Trait groups: {args.trait_groups}")
+    print(f"Class balance mode: {getattr(args, 'class_balance_mode', 'none')}")
     model_variant = str(getattr(args, "model_variant", "legacy"))
     print(f"Model variant: {model_variant}")
     if model_variant == "canonical_moe":
@@ -435,7 +452,26 @@ def run_trait_score_training(args):
             trait_name: emb[valid_indices]
             for trait_name, emb in embeddings_dict.items()
         }
-        train_loader = _build_loader(trait_embeddings, labels, train_idx, args, shuffle=True)
+        class_balance_mode = str(getattr(args, "class_balance_mode", "none"))
+        class_weights = maybe_build_class_weight_tensor(
+            labels[train_idx],
+            class_balance_mode=class_balance_mode,
+            num_classes=len(unique_labels),
+        )
+        train_sampler = maybe_build_weighted_sampler(
+            labels[train_idx],
+            class_balance_mode=class_balance_mode,
+            num_classes=len(unique_labels),
+            seed=args.seed,
+        )
+        train_loader = _build_loader(
+            trait_embeddings,
+            labels,
+            train_idx,
+            args,
+            shuffle=train_sampler is None,
+            sampler=train_sampler,
+        )
         val_loader = _build_loader(trait_embeddings, labels, val_idx, args, shuffle=False)
         test_loader = _build_loader(trait_embeddings, labels, test_idx, args, shuffle=False)
 
@@ -480,7 +516,8 @@ def run_trait_score_training(args):
             if args.scheduler == "cosine"
             else None
         )
-        criterion = nn.CrossEntropyLoss().to(device)
+        criterion_weight = class_weights.to(device) if class_weights is not None else None
+        criterion = nn.CrossEntropyLoss(weight=criterion_weight).to(device)
 
         checkpoint_path = output_dir / build_checkpoint_name(args.dataset, "trait_score", target_trait)
         stopper = (
